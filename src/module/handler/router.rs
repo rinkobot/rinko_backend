@@ -71,7 +71,7 @@ async fn router(
             //         return response;
             //     }
             // };
-            let uri: String = "file:///server_runtime_data/pic/solar_image_latest.png".to_string();
+            let uri: String = "https://www.hamqsl.com/solarn0nbh.php?image=random".to_string();
             response = ApiResponse {
                 success: true,
                 data: Some(vec![uri]),

@@ -260,6 +260,10 @@ pub async fn scheduled_task_handler(
         ws::eq_listener(&app_status_cp4).await;
     });
 
+    // let verify_api_task = tokio::spawn(async move {
+    //     crate::module::tools::api_verification::verify_api_handler().await;
+    // });
+
     let _old_satstatus_img_cleanup_task = tokio::spawn(start_cleanup_task());
 }
 

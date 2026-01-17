@@ -526,3 +526,46 @@ pub async fn render_satstatus_data(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::module::amsat::prelude::{SatStatus, SatelliteFileElement};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn test_render_satstatus_data() {
+        let sample_data = vec![
+            SatelliteFileFormat {
+                name: "TestSat 1".to_string(),
+                last_update_time: "2025-08-25T10:00:00Z".to_string(),
+                amsat_update_status: true,
+                data: vec![
+                    SatelliteFileElement {
+                        report: vec![
+                            SatStatus {
+                                name: "TestSat 1".to_string(),
+                                callsign: "CALL1".to_string(),
+                                grid_square: "AB12".to_string(),
+                                reported_time: "2025-08-25T09:30:00Z".to_string(),
+                                report: "Heard".to_string(),
+                            },
+                            SatStatus {
+                                name: "TestSat 2".to_string(),
+                                callsign: "CALL2".to_string(),
+                                grid_square: "CD34".to_string(),
+                                reported_time: "2025-08-25T09:45:00Z".to_string(),
+                                report: "Heard".to_string(),
+                            },
+                        ],
+                        time: "2025-08-25T09:00:00Z".to_string(),
+                    },
+                ],
+            },
+        ];
+
+        let output_path = "test_satstatus.png".to_string();
+        let result = render_satstatus_data(&sample_data, output_path).await;
+        assert!(result.is_ok());
+    }
+}

@@ -214,3 +214,43 @@ pub async fn send_picture_to_multiple_groups(
         }
     }
 }
+
+/// 临时使用，硬编码的群消息发送函数
+pub async fn temp_send_message_to_group(payload: String) {
+    let url = "http://localhost:3300".to_string();
+    let group_id = 926964196; // 替换为实际的群号
+    let msg_body = serde_json::json!({
+        "group_id": group_id,
+        "message": [
+            {
+                "type": "text",
+                "data": {
+                    "text": payload
+                }
+            }
+        ]
+    });
+    let endpoint_url = format!("{}/send_group_msg", url);
+    let client = reqwest::Client::new();
+    let response = client
+        .post(endpoint_url)
+        .json(&msg_body)
+        .send()
+        .await;
+
+    match response {
+        Ok(res) => {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_else(|_| "<Failed to read body>".to_string());
+            if !status.is_success() {
+                tracing::error!("{}: {}", i18n::text("send_group_msg_err"), body);
+            }
+            if body.contains("error") {
+                tracing::error!("{}: {}", i18n::text("send_group_msg_err"), body);
+            }
+        }
+        Err(err) => {
+            tracing::error!("{}: {}", i18n::text("send_group_msg_err"), err);
+        }
+    }
+}
