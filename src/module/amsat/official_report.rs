@@ -640,7 +640,7 @@ pub async fn query_satellite_status(
 
     // check if input contains `fm`
     if inputs.iter().any(|&s| s.to_ascii_lowercase() == "fm") {
-        sat_query_list = vec!["AO-91", "PO-101[FM]", "ISS-FM", "SO-50", "AO-123 FM", "SO-124", "SO-125", "RS95s"]
+        sat_query_list = vec!["AO-91", "IO-86", "PO-101[FM]", "ISS-FM", "SO-50", "AO-123 FM", "SO-124", "SO-125", "RS95s"]
             .iter()
             .map(|s| s.to_string())
             .collect();
