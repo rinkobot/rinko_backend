@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "rinko-common",
+    "rinko-frontend",
+    "rinko-backend",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["BG5FNA <bg5fna@rinkosoft.me>"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.49.0", features = ["full"] }
+tokio-stream = "0.1.18"
+
+# gRPC and serialization
+tonic = "0.12.3"
+prost = "0.13.3"
+prost-types = "0.13.3"
+tonic-build = "0.12.3"
+
+# HTTP and web
+axum = "0.8.8"
+axum-server = "0.8.0"
+tower = "0.5.2"
+reqwest = { version = "0.13.1", features = ["json"] }
+
+# Serialization
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "0.9.11"
+
+# Logging and tracing
+tracing = "0.1.44"
+tracing-appender = "0.2.4"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1.0.100"
+thiserror = "1.0.69"
+
+# Utilities
+chrono = "0.4.43"
+uuid = { version = "1.20.0", features = ["v7"] }
+hex = "0.4.3"
+regex = "1.12.2"
+
+# Cryptography
+ed25519-dalek = "2.2.0"
+
+# Async utilities
+async-stream = "0.3.6"
+async-trait = "0.1.89"
+futures = "0.3.31"

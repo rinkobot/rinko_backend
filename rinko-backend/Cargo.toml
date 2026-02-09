@@ -1,0 +1,27 @@
+[package]
+name = "rinko-backend"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rinko-backend"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace shared dependencies
+rinko-common = { path = "../rinko-common" }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+futures = { workspace = true }
