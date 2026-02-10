@@ -1,3 +1,13 @@
-/*/target
+/logs
+/ref
+/.github
+/runtime_data
 /target
+/*/logs
+/*/ref
+/*/.github
+/*/runtime_data
+/*/target
+/*/config.toml
 config.toml
+*.ps1

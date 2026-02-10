@@ -2,4 +2,5 @@
 /ref
 /.github
 /runtime_data
+/target
 config.toml

@@ -12,6 +12,7 @@ pub struct QQConfig {
     pub app_id: String,
     pub client_secret: String,       // also used as bot_secret for webhook signature verification
     pub access_token: String,
+    #[serde(skip)]
     pub token_expires_in: u64,       // expire time in seconds
     #[serde(skip)]
     pub client: reqwest::Client,
@@ -58,7 +59,7 @@ pub fn read_config() -> anyhow::Result<()> {
     let config: BotConfigs = match toml::from_str(&config_str) {
         Ok(cfg) => cfg,
         Err(e) => {
-            tracing::error!("Failed to parse config file {}: {}", path, e);
+            eprintln!("Failed to parse config file {}: {}", path, e);
             panic!()
         }
     };
