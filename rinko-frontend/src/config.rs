@@ -54,7 +54,7 @@ pub struct BotConfigs {
 pub static CONFIG: OnceLock<BotConfigs> = OnceLock::new();
     
 pub fn read_config() -> anyhow::Result<()> {
-    let path = "config.toml";
+    let path = "../config.toml";
     let config_str = std::fs::read_to_string(path)?;
     let config: BotConfigs = match toml::from_str(&config_str) {
         Ok(cfg) => cfg,

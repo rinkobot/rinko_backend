@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackendConfig {
@@ -13,7 +14,7 @@ pub struct BackendConfig {
 }
 
 fn default_host() -> String {
-    "0.0.0.0".to_string()
+    "127.0.0.1".to_string()
 }
 
 fn default_port() -> u16 {
@@ -34,13 +35,25 @@ impl Default for BackendConfig {
     }
 }
 
-impl BackendConfig {
-    pub fn from_file(path: &str) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: BackendConfig = toml::from_str(&content)?;
-        Ok(config)
-    }
+pub static CONFIG: OnceLock<BackendConfig> = OnceLock::new();
 
+pub fn read_config() -> anyhow::Result<()> {
+    let path = "../config.toml";
+    let config_str = std::fs::read_to_string(path)?;
+    let config: BackendConfig = match toml::from_str(&config_str) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("Failed to parse config file {}: {}", path, e);
+            panic!()
+        }
+    };
+
+    CONFIG.set(config.clone()).unwrap();
+
+    Ok(())
+}
+
+impl BackendConfig {
     pub fn server_address(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }

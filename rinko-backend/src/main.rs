@@ -6,17 +6,13 @@ use tonic::transport::Server;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use rinko_common::proto::bot_backend_server::BotBackendServer;
-use config::BackendConfig;
 use service::BotBackendService;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // Load configuration
-    let config = BackendConfig::from_file("config.toml")
-        .unwrap_or_else(|_| {
-            tracing::warn!("Failed to load config.toml, using defaults");
-            BackendConfig::default()
-        });
+    config::read_config()?;
+    let config = config::CONFIG.get().unwrap();
 
     // Initialize logging
     tracing_subscriber::registry()
