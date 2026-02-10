@@ -9,6 +9,7 @@ enum Platform {
   ENTERPRISE_WECHAT = 2;
   TELEGRAM = 3;
   DISCORD = 4;
+  LLONEBOT = 5;
 }
 
 // Unified message structure for cross-platform communication

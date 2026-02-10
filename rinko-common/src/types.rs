@@ -11,6 +11,8 @@ pub enum Platform {
     Telegram,
     #[serde(rename = "discord")]
     Discord,
+    #[serde(rename = "llonebot")]
+    LLOneBot,
 }
 
 impl Platform {
@@ -20,6 +22,7 @@ impl Platform {
             Platform::EnterpriseWechat => crate::proto::Platform::EnterpriseWechat,
             Platform::Telegram => crate::proto::Platform::Telegram,
             Platform::Discord => crate::proto::Platform::Discord,
+            Platform::LLOneBot => crate::proto::Platform::Llonebot,
         }
     }
 
@@ -30,6 +33,7 @@ impl Platform {
             crate::proto::Platform::EnterpriseWechat => Some(Platform::EnterpriseWechat),
             crate::proto::Platform::Telegram => Some(Platform::Telegram),
             crate::proto::Platform::Discord => Some(Platform::Discord),
+            crate::proto::Platform::Llonebot => Some(Platform::LLOneBot),
         }
     }
 
@@ -39,6 +43,7 @@ impl Platform {
             Platform::EnterpriseWechat => "enterprise_wechat",
             Platform::Telegram => "telegram",
             Platform::Discord => "discord",
+            Platform::LLOneBot => "llonebot",
         }
     }
 }
@@ -58,6 +63,7 @@ impl std::str::FromStr for Platform {
             "enterprise_wechat" | "enterprisewechat" => Ok(Platform::EnterpriseWechat),
             "telegram" => Ok(Platform::Telegram),
             "discord" => Ok(Platform::Discord),
+            "llonebot" => Ok(Platform::LLOneBot),
             _ => Err(format!("Unknown platform: {}", s)),
         }
     }
