@@ -68,3 +68,34 @@ impl std::str::FromStr for Platform {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ContentType {
+    Unspecified,
+    Text,
+    Image,
+    Video,
+    File,
+}
+
+impl ContentType {
+    pub fn to_proto(&self) -> crate::proto::ContentType {
+        match self {
+            ContentType::Unspecified => crate::proto::ContentType::Unspecified,
+            ContentType::Text => crate::proto::ContentType::Text,
+            ContentType::Image => crate::proto::ContentType::Image,
+            ContentType::Video => crate::proto::ContentType::Video,
+            ContentType::File => crate::proto::ContentType::File,
+        }
+    }
+
+    pub fn from_proto(proto: crate::proto::ContentType) -> Option<Self> {
+        match proto {
+            crate::proto::ContentType::Unspecified => None,
+            crate::proto::ContentType::Text => Some(ContentType::Text),
+            crate::proto::ContentType::Image => Some(ContentType::Image),
+            crate::proto::ContentType::Video => Some(ContentType::Video),
+            crate::proto::ContentType::File => Some(ContentType::File),
+        }
+    }
+}

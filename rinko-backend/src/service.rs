@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, mpsc};
 use tonic::{Request, Response, Status, Code};
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{info, warn, debug};
+use tracing::{info, warn, debug, error};
 
 use rinko_common::proto::{
     bot_backend_server::BotBackend,
@@ -13,8 +13,12 @@ use rinko_common::proto::{
     SubscribeRequest,
     HeartbeatRequest,
     HeartbeatResponse,
+    ContentType,
 };
 use rinko_common::Platform;
+
+use crate::model::handler::MessageHandler;
+use crate::model::sat::SatelliteManager;
 
 /// Frontend connection info
 #[derive(Debug, Clone)]
@@ -28,12 +32,17 @@ struct FrontendConnection {
 pub struct BotBackendService {
     // Store connected frontends
     frontends: Arc<RwLock<HashMap<String, FrontendConnection>>>,
+    // Message handler
+    message_handler: Arc<MessageHandler>,
 }
 
 impl BotBackendService {
-    pub fn new() -> Self {
+    pub fn new(satellite_manager: Arc<SatelliteManager>) -> Self {
+        let message_handler = Arc::new(MessageHandler::new(satellite_manager));
+        
         Self {
             frontends: Arc::new(RwLock::new(HashMap::new())),
+            message_handler,
         }
     }
 
@@ -82,7 +91,7 @@ impl BotBackend for BotBackendService {
         &self,
         request: Request<UnifiedMessage>,
     ) -> Result<Response<MessageResponse>, Status> {
-        let msg = request.into_inner();
+        let msg: UnifiedMessage = request.into_inner();
         
         info!(
             "Received message from platform {:?}: event_id={}, content_preview={}",
@@ -91,13 +100,18 @@ impl BotBackend for BotBackendService {
             &msg.content.chars().take(50).collect::<String>()
         );
 
-        // TODO: Process the message (save to DB, trigger handlers, etc.)
-        
-        // Return success response
-        let response = MessageResponse {
-            success: true,
-            message: "Rinko backend".to_string(),
-            message_id: uuid::Uuid::now_v7().to_string(),
+        // Process the message through handler
+        let response = match self.message_handler.handle_message(&msg).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("Failed to handle message: {}", e);
+                MessageResponse {
+                    success: false,
+                    message: format!("Internal error: {}", e),
+                    message_id: uuid::Uuid::now_v7().to_string(),
+                    content_type: ContentType::Text as i32,
+                }
+            }
         };
 
         Ok(Response::new(response))

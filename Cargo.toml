@@ -43,7 +43,7 @@ anyhow = "1.0.100"
 thiserror = "1.0.69"
 
 # Utilities
-chrono = "0.4.43"
+chrono = { version = "0.4.43", features = ["serde"]}
 uuid = { version = "1.20.0", features = ["v7"] }
 hex = "0.4.3"
 regex = "1.12.2"

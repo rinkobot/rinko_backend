@@ -12,6 +12,14 @@ enum Platform {
   LLONEBOT = 5;
 }
 
+enum ContentType {
+  CONTENT_TYPE_UNSPECIFIED = 0;
+  TEXT = 1;
+  IMAGE = 2;
+  VIDEO = 3;
+  FILE = 4;
+}
+
 // Unified message structure for cross-platform communication
 message UnifiedMessage {
   string event_id = 1; // UUID as string
@@ -26,6 +34,7 @@ message MessageResponse {
   bool success = 1;
   string message = 2;
   string message_id = 3; // Backend-assigned message ID
+  ContentType content_type = 4; // Type of the content
 }
 
 // Command from backend to frontend
