@@ -1,166 +1,238 @@
+///! Core data structures for satellite status management
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 
-/// 卫星状态枚举
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub enum SatelliteStatus {
-    /// 在轨运行
-    Operational,
-    /// 部分功能
-    PartiallyOperational,
-    /// 非运行状态
-    NonOperational,
-    /// 已失联
-    Lost,
-    /// 已再入
-    Deorbited,
-    /// 未知状态
-    Unknown,
-}
-
-impl Default for SatelliteStatus {
-    fn default() -> Self {
-        SatelliteStatus::Unknown
-    }
-}
-
-/// AMSAT API 返回的单条报告
+/// Satellite report from AMSAT API
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmsatReport {
-    /// 卫星名称
     pub name: String,
-    /// 报告时间
-    pub reported_time: String,
-    /// 呼号
+    pub reported_time: String,  // RFC3339 format
     pub callsign: String,
-    /// 报告内容
     pub report: String,
-    /// 网格方块
     pub grid_square: String,
 }
 
-/// 卫星完整信息
+impl Default for AmsatReport {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            reported_time: String::new(),
+            callsign: String::new(),
+            report: ReportStatus::Grey.to_string(),
+            grid_square: String::new(),
+        }
+    }
+}
+
+/// Report status enum
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReportStatus {
+    Blue,    // Transponder/Repeater active
+    Yellow,  // Beacon/Telemetry only
+    Orange,  // Conflicting reports
+    Red,     // No signal
+    Purple,  // ISS Crew voice active
+    Grey,    // Unknown status
+}
+
+impl ReportStatus {
+    /// Convert to user-friendly string
+    pub fn to_string(&self) -> String {
+        match self {
+            ReportStatus::Blue => "Transponder/Repeater active".to_string(),
+            ReportStatus::Yellow => "Telemetry/Beacon only".to_string(),
+            ReportStatus::Orange => "Conflicting reports".to_string(),
+            ReportStatus::Red => "No signal".to_string(),
+            ReportStatus::Purple => "ISS Crew (Voice) Active".to_string(),
+            ReportStatus::Grey => "Unknown status".to_string(),
+        }
+    }
+
+    /// Convert to report format string
+    pub fn to_report_format(&self) -> String {
+        match self {
+            ReportStatus::Blue => "Heard".to_string(),
+            ReportStatus::Yellow => "Telemetry Only".to_string(),
+            ReportStatus::Red => "Not Heard".to_string(),
+            ReportStatus::Purple => "Crew Active".to_string(),
+            _ => "Unknown status".to_string(),
+        }
+    }
+
+    /// Parse from string
+    pub fn from_string(s: &str) -> Self {
+        match s.to_lowercase().as_str() {
+            "heard" => ReportStatus::Blue,
+            "telemetry only" => ReportStatus::Yellow,
+            "conflicting reports" => ReportStatus::Orange,
+            "not heard" => ReportStatus::Red,
+            "crew active" => ReportStatus::Purple,
+            _ => ReportStatus::Grey,
+        }
+    }
+
+    /// Convert to hex color for rendering
+    pub fn to_color_hex(&self) -> &'static str {
+        match self {
+            ReportStatus::Blue => "#4297f3ff",
+            ReportStatus::Yellow => "#f3cd36ff",
+            ReportStatus::Orange => "#f97316",
+            ReportStatus::Red => "#ed3f3fff",
+            ReportStatus::Purple => "#946af5ff",
+            ReportStatus::Grey => "#6b7280",
+        }
+    }
+
+    /// Get color from string status
+    pub fn string_to_color_hex(status: &str) -> &'static str {
+        Self::from_string(status).to_color_hex()
+    }
+}
+
+/// Satellite data block (one hour block)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SatelliteDataBlock {
+    pub time: String,                   // Time block (e.g., "2026-02-16T08:00:00Z")
+    pub reports: Vec<AmsatReport>,      // Reports for this time block
+}
+
+/// Satellite complete information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SatelliteInfo {
-    /// 卫星名称（主名称）
     pub name: String,
-    
-    /// 卫星编号（NORAD ID等，占位符）
-    #[serde(default)]
-    pub catalog_number: Option<String>,
-    
-    /// 卫星状态
-    #[serde(default)]
-    pub status: SatelliteStatus,
-    
-    /// 别名列表（用于搜索）
-    #[serde(default)]
     pub aliases: Vec<String>,
-    
-    /// 最新报告列表
-    #[serde(default)]
-    pub recent_reports: Vec<AmsatReport>,
-    
-    /// 最后更新时间
-    #[serde(default = "default_datetime")]
+    pub catalog_number: Option<String>,        // International satellite catalog number
+    pub data_blocks: Vec<SatelliteDataBlock>,  // Reports grouped by hour
     pub last_updated: DateTime<Utc>,
-    
-    /// 最后成功拉取时间
-    #[serde(default)]
     pub last_fetch_success: Option<DateTime<Utc>>,
-    
-    /// 是否活跃（最近有报告）
-    #[serde(default)]
-    pub is_active: bool,
-    
-    /// 扩展字段（为未来功能预留）
-    #[serde(default)]
-    pub metadata: HashMap<String, String>,
+    pub is_active: bool,                       // Active flag instead of deletion
+    pub amsat_update_status: bool,             // Whether last AMSAT update succeeded
+    pub metadata: HashMap<String, String>,     // Extension fields
 }
 
-fn default_datetime() -> DateTime<Utc> {
-    Utc::now()
-}
-
-impl SatelliteInfo {
-    /// 创建新的卫星信息
-    pub fn new(name: String) -> Self {
+impl Default for SatelliteInfo {
+    fn default() -> Self {
         Self {
-            name: name.clone(),
+            name: String::new(),
+            aliases: Vec::new(),
             catalog_number: None,
-            status: SatelliteStatus::Unknown,
-            aliases: vec![name.clone()],
-            recent_reports: Vec::new(),
+            data_blocks: Vec::new(),
             last_updated: Utc::now(),
             last_fetch_success: None,
-            is_active: false,
+            is_active: true,
+            amsat_update_status: false,
             metadata: HashMap::new(),
         }
     }
-    
-    /// 更新卫星报告
-    pub fn update_reports(&mut self, reports: Vec<AmsatReport>) {
-        self.recent_reports = reports;
-        self.last_updated = Utc::now();
-        self.last_fetch_success = Some(Utc::now());
-        self.is_active = !self.recent_reports.is_empty();
+}
+
+impl SatelliteInfo {
+    /// Create new satellite info with name
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ..Default::default()
+        }
     }
-    
-    /// 标记获取失败
-    pub fn mark_fetch_failed(&mut self) {
-        self.last_updated = Utc::now();
-        // 不更新 last_fetch_success
+
+    /// Check if satellite has recent data (within 48 hours)
+    pub fn has_recent_data(&self) -> bool {
+        if let Some(last_success) = self.last_fetch_success {
+            (Utc::now() - last_success).num_hours() <= 48
+        } else {
+            false
+        }
     }
-    
-    /// 检查是否需要更新
-    pub fn needs_update(&self, interval_minutes: i64) -> bool {
-        let now = Utc::now();
-        let duration = now.signed_duration_since(self.last_updated);
-        duration.num_minutes() >= interval_minutes
+
+    /// Get total number of reports
+    pub fn total_reports(&self) -> usize {
+        self.data_blocks.iter()
+            .map(|block| block.reports.len())
+            .sum()
     }
 }
 
-/// 卫星列表导出格式（用于本地文件）
+/// Satellite list configuration (stored in TOML)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SatelliteListExport {
-    /// 导出时间
-    pub exported_at: DateTime<Utc>,
-    
-    /// 活跃卫星数量
-    pub active_count: usize,
-    
-    /// 总卫星数量
-    pub total_count: usize,
-    
-    /// 卫星列表（简化版）
+pub struct SatelliteList {
     pub satellites: Vec<SatelliteEntry>,
 }
 
-/// 卫星条目（简化版）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SatelliteEntry {
-    /// 主名称
-    pub name: String,
-    
-    /// 别名
-    pub aliases: Vec<String>,
-    
-    /// 是否活跃
-    pub is_active: bool,
-    
-    /// 状态
-    pub status: SatelliteStatus,
+impl Default for SatelliteList {
+    fn default() -> Self {
+        Self {
+            satellites: Vec::new(),
+        }
+    }
 }
 
-/// AMSAT 已知卫星名称列表（从API文档获取）
-pub const KNOWN_SATELLITES: &[&str] = &[
-    "AISAT-1", "AO-123", "AO-16", "AO-27", "AO-73", "AO-7[A]", "AO-7[B]", 
-    "AO-85", "AO-91", "CAS-2T", "CAS-4A", "CAS-4B", "CatSat", "CUTE-1", 
-    "DSTAR1", "DUCHIFAT1", "DUCHIFAT3", "EO-79", "EO-80", "ESEO", 
-    "FloripaSat-1", "FO-118[H/u]", "FO-118[V/u+FM]", "FO-118[V/u]", "FO-29", 
-    "FO-99", "GO-32", "HA-1", "HO-107", "HO-113", "IO-117", "IO-26", "IO-86", 
-    "ISS-DATA", "ISS-DATV", "ISS-FM", "ISS-SSTV", "JO-97", "K2SAT", 
-    "LEDSAT", "LilacSat-2", "LO-19", "LO-87", "LO-90", "LO-93", "MO-122", 
-    "NO-44", "NO-45", "OUFTI-1",
-];
+/// Satellite entry in configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SatelliteEntry {
+    pub official_name: String,
+    pub aliases: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_number: Option<String>,
+}
+
+impl SatelliteEntry {
+    pub fn new(official_name: impl Into<String>) -> Self {
+        Self {
+            official_name: official_name.into(),
+            aliases: Vec::new(),
+            catalog_number: None,
+        }
+    }
+}
+
+/// Update report summary
+#[derive(Debug, Clone)]
+pub struct UpdateReport {
+    pub total_satellites: usize,
+    pub successful_updates: usize,
+    pub failed_updates: usize,
+    pub new_satellites: Vec<String>,
+    pub inactive_satellites: Vec<String>,
+    pub duration_seconds: f64,
+}
+
+impl UpdateReport {
+    pub fn new() -> Self {
+        Self {
+            total_satellites: 0,
+            successful_updates: 0,
+            failed_updates: 0,
+            new_satellites: Vec::new(),
+            inactive_satellites: Vec::new(),
+            duration_seconds: 0.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_report_status_conversion() {
+        assert_eq!(ReportStatus::from_string("heard"), ReportStatus::Blue);
+        assert_eq!(ReportStatus::from_string("Heard"), ReportStatus::Blue);
+        assert_eq!(ReportStatus::from_string("not heard"), ReportStatus::Red);
+        assert_eq!(ReportStatus::from_string("unknown"), ReportStatus::Grey);
+    }
+
+    #[test]
+    fn test_report_status_color() {
+        assert_eq!(ReportStatus::Blue.to_color_hex(), "#4297f3ff");
+        assert_eq!(ReportStatus::Red.to_color_hex(), "#ed3f3fff");
+    }
+
+    #[test]
+    fn test_satellite_info_creation() {
+        let sat = SatelliteInfo::new("AO-91");
+        assert_eq!(sat.name, "AO-91");
+        assert!(sat.is_active);
+        assert_eq!(sat.total_reports(), 0);
+    }
+}

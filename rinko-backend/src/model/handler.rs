@@ -1,10 +1,10 @@
 ///! Handles requests related to the model.
-use rinko_common::proto::{UnifiedMessage, MessageResponse};
+use rinko_common::proto::{UnifiedMessage, MessageResponse, ContentType};
 use regex::Regex;
 use anyhow::Result;
 use std::sync::Arc;
 
-use super::sat::{SatelliteManager, SatelliteInfo};
+use super::sat::{SatelliteManager, SatelliteInfo, SatelliteRenderer};
 
 /// Message handler with satellite manager
 pub struct MessageHandler {
@@ -82,58 +82,56 @@ impl MessageHandler {
                 success: false,
                 message: "Please provide a satellite name to query. Example: /q AO-91".to_string(),
                 message_id: uuid::Uuid::now_v7().to_string(),
-                content_type: rinko_common::proto::ContentType::Text as i32,
+                content_type: ContentType::Text as i32,
             });
         }
         
         // Search for satellites
-        match self.satellite_manager.query_satellite(query).await {
-            Ok(Some(sat_info)) => {
-                let response_text = format_satellite_info(&sat_info);
+        let satellites = self.satellite_manager.search_satellites(query).await?;
+        
+        if satellites.is_empty() {
+            return Ok(MessageResponse {
+                success: false,
+                message: format!("Satellite '{}' not found. Try searching by name or alias.", query),
+                message_id: uuid::Uuid::now_v7().to_string(),
+                content_type: ContentType::Text as i32,
+            });
+        }
+        
+        // Limit to 5 satellites per query
+        let limited_satellites: Vec<_> = satellites.into_iter().take(5).collect();
+        
+        // Try to render as image
+        let cache_dir = self.satellite_manager.cache_dir();
+        let images_dir = cache_dir.join("rendered_images");
+        let renderer = SatelliteRenderer::new(&images_dir);
+        
+        match renderer.render_satellites(&limited_satellites).await {
+            Ok(image_path) => {
+                // Return image path
+                let path_str = image_path.to_string_lossy().to_string();
+                Ok(MessageResponse {
+                    success: true,
+                    message: format!("file:///{}", path_str.replace("\\", "/")),
+                    message_id: uuid::Uuid::now_v7().to_string(),
+                    content_type: ContentType::Image as i32,
+                })
+            }
+            Err(e) => {
+                // Fallback to text format if rendering fails
+                tracing::warn!("Image rendering failed, falling back to text: {}", e);
+                
+                let response_text = if limited_satellites.len() == 1 {
+                    format_satellite_info(&limited_satellites[0])
+                } else {
+                    format_multiple_satellites(&limited_satellites)
+                };
+                
                 Ok(MessageResponse {
                     success: true,
                     message: response_text,
                     message_id: uuid::Uuid::now_v7().to_string(),
-                    content_type: rinko_common::proto::ContentType::Text as i32,
-                })
-            }
-            Ok(None) => {
-                // Try searching for similar satellites
-                match self.satellite_manager.search_satellites(query).await {
-                    Ok(results) if !results.is_empty() => {
-                        let suggestions: Vec<String> = results
-                            .iter()
-                            .take(5)
-                            .map(|s| s.name.clone())
-                            .collect();
-                        
-                        Ok(MessageResponse {
-                            success: false,
-                            message: format!(
-                                "Satellite '{}' not found. Did you mean: {}",
-                                query,
-                                suggestions.join(", ")
-                            ),
-                            message_id: uuid::Uuid::now_v7().to_string(),
-                            content_type: rinko_common::proto::ContentType::Text as i32,
-                        })
-                    }
-                    _ => {
-                        Ok(MessageResponse {
-                            success: false,
-                            message: format!("Satellite '{}' not found in database.", query),
-                            message_id: uuid::Uuid::now_v7().to_string(),
-                            content_type: rinko_common::proto::ContentType::Text as i32,
-                        })
-                    }
-                }
-            }
-            Err(e) => {
-                Ok(MessageResponse {
-                    success: false,
-                    message: format!("Query failed: {}", e),
-                    message_id: uuid::Uuid::now_v7().to_string(),
-                    content_type: rinko_common::proto::ContentType::Text as i32,
+                    content_type: ContentType::Text as i32,
                 })
             }
         }
@@ -157,38 +155,56 @@ fn format_satellite_info(sat: &SatelliteInfo) -> String {
     let mut output = String::new();
     
     output.push_str(&format!("🛰️ Satellite: {}\n", sat.name));
-    output.push_str(&format!("Status: {:?}\n", sat.status));
-    output.push_str(&format!("Active: {}\n", if sat.is_active { "Yes" } else { "No" }));
+    output.push_str(&format!("Active: {}\n", if sat.is_active { "✓ Yes" } else { "✗ No" }));
+    output.push_str(&format!(
+        "Update Status: {}\n",
+        if sat.amsat_update_status { "✓ OK" } else { "✗ Failed" }
+    ));
+    
+    if let Some(catalog_num) = &sat.catalog_number {
+        output.push_str(&format!("Catalog: {}\n", catalog_num));
+    }
     
     if let Some(last_fetch) = sat.last_fetch_success {
         output.push_str(&format!("Last Updated: {}\n", last_fetch.format("%Y-%m-%d %H:%M UTC")));
     }
     
-    if !sat.aliases.is_empty() && sat.aliases.len() > 1 {
+    if !sat.aliases.is_empty() {
         output.push_str(&format!("Aliases: {}\n", sat.aliases.join(", ")));
     }
     
-    if !sat.recent_reports.is_empty() {
-        output.push_str(&format!("\nRecent Reports ({}):\n", sat.recent_reports.len()));
-        for (i, report) in sat.recent_reports.iter().take(5).enumerate() {
+    let total_reports = sat.total_reports();
+    output.push_str(&format!("\nTotal Reports: {}\n", total_reports));
+    
+    if !sat.data_blocks.is_empty() {
+        output.push_str("\nRecent Time Blocks:\n");
+        for (i, block) in sat.data_blocks.iter().take(3).enumerate() {
             output.push_str(&format!(
-                "  {}. {} - {} ({})\n",
+                "  {}. {} ({} reports)\n",
                 i + 1,
-                report.reported_time,
-                report.callsign,
-                report.grid_square
+                block.time,
+                block.reports.len()
             ));
-            if !report.report.is_empty() {
-                let report_preview = if report.report.len() > 80 {
-                    format!("{}...", &report.report[..80])
-                } else {
-                    report.report.clone()
-                };
-                output.push_str(&format!("     {}\n", report_preview));
-            }
         }
-    } else {
-        output.push_str("\nNo recent reports available.\n");
+    }
+    
+    output
+}
+
+/// Format multiple satellites for display
+fn format_multiple_satellites(satellites: &[SatelliteInfo]) -> String {
+    let mut output = String::new();
+    
+    output.push_str(&format!("🛰️ Found {} satellites:\n\n", satellites.len()));
+    
+    for (i, sat) in satellites.iter().enumerate() {
+        output.push_str(&format!(
+            "{}. {} - {} (Reports: {})\n",
+            i + 1,
+            sat.name,
+            if sat.is_active { "Active" } else { "Inactive" },
+            sat.total_reports()
+        ));
     }
     
     output

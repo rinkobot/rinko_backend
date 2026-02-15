@@ -1,101 +1,240 @@
-use anyhow::Result;
-use std::sync::Arc;
-use tokio::time::{interval, Duration};
-use tracing::{error, info};
-
+///! Satellite updater - scheduled update tasks
 use super::manager::SatelliteManager;
+use chrono::{DateTime, Timelike, Utc};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::task::JoinHandle;
 
-/// 定时更新任务
+const MAX_RETRIES: u32 = 3;
+const RETRY_DELAY_SECONDS: u64 = 60;
+const UPDATE_TIMEOUT_SECONDS: u64 = 300; // 5 minutes
+
+/// Satellite updater handles scheduled updates
 pub struct SatelliteUpdater {
     manager: Arc<SatelliteManager>,
     update_interval_minutes: u64,
 }
 
 impl SatelliteUpdater {
-    /// 创建新的更新任务
+    /// Create a new updater
     pub fn new(manager: Arc<SatelliteManager>, update_interval_minutes: u64) -> Self {
         Self {
             manager,
             update_interval_minutes,
         }
     }
-    
-    /// 启动定时更新任务
+
+    /// Start updater with immediate initial update
     /// 
-    /// 这个函数会启动一个后台任务，每隔指定的时间间隔自动更新所有卫星状态
-    pub fn start(self) -> tokio::task::JoinHandle<()> {
-        info!(
-            "Starting satellite updater (interval: {} minutes)",
-            self.update_interval_minutes
-        );
-        
-        tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_secs(self.update_interval_minutes * 60));
-            
-            loop {
-                ticker.tick().await;
-                
-                info!("Triggering scheduled satellite update");
-                
-                match self.manager.update_all_satellites().await {
-                    Ok(_) => {
-                        let (total, active) = self.manager.get_satellite_count().await;
-                        info!(
-                            "Scheduled update completed successfully: {} total, {} active",
-                            total, active
-                        );
+    /// Performs one update immediately, then starts the scheduled loop.
+    /// Returns a JoinHandle for the background task.
+    pub async fn start_with_initial_update(self) -> anyhow::Result<JoinHandle<()>> {
+        tracing::info!("Starting satellite updater (initial update + schedule)");
+
+        // Perform initial update
+        self.run_update_cycle().await;
+
+        // Start scheduled updates
+        let handle = tokio::spawn(async move {
+            self.run_scheduled_loop().await;
+        });
+
+        Ok(handle)
+    }
+
+    /// Start updater without initial update
+    /// 
+    /// Calculates next update time and starts the scheduled loop.
+    /// Returns a JoinHandle for the background task.
+    pub async fn start(self) -> anyhow::Result<JoinHandle<()>> {
+        tracing::info!("Starting satellite updater (scheduled only)");
+
+        let handle = tokio::spawn(async move {
+            self.run_scheduled_loop().await;
+        });
+
+        Ok(handle)
+    }
+
+    /// Run the scheduled update loop
+    async fn run_scheduled_loop(&self) {
+        loop {
+            let now = Utc::now();
+            let next_trigger = self.calculate_next_trigger(now);
+            let sleep_duration = (next_trigger - now)
+                .to_std()
+                .unwrap_or(Duration::from_secs(60));
+
+            tracing::info!(
+                "Next satellite update scheduled at: {} (in {:.1} minutes)",
+                next_trigger.format("%Y-%m-%d %H:%M:%S UTC"),
+                sleep_duration.as_secs_f64() / 60.0
+            );
+
+            tokio::time::sleep(sleep_duration).await;
+
+            self.run_update_cycle().await;
+        }
+    }
+
+    /// Run a single update cycle with retries
+    async fn run_update_cycle(&self) {
+        for attempt in 1..=MAX_RETRIES {
+            tracing::info!(
+                "Starting satellite update (attempt {}/{})",
+                attempt,
+                MAX_RETRIES
+            );
+
+            let result = tokio::time::timeout(
+                Duration::from_secs(UPDATE_TIMEOUT_SECONDS),
+                self.manager.update_all_satellites(),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(report)) => {
+                    tracing::info!(
+                        "✓ Satellite update completed: {} successful, {} failed, {} new, {:.2}s",
+                        report.successful_updates,
+                        report.failed_updates,
+                        report.new_satellites.len(),
+                        report.duration_seconds
+                    );
+
+                    if !report.new_satellites.is_empty() {
+                        tracing::info!("New satellites: {:?}", report.new_satellites);
                     }
-                    Err(e) => {
-                        error!("Scheduled update failed: {}", e);
+
+                    if !report.inactive_satellites.is_empty() {
+                        tracing::warn!("Inactive satellites: {:?}", report.inactive_satellites);
                     }
+
+                    // Success, break retry loop
+                    break;
+                }
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        "✗ Satellite update failed (attempt {}/{}): {}",
+                        attempt,
+                        MAX_RETRIES,
+                        e
+                    );
+                }
+                Err(_) => {
+                    tracing::error!(
+                        "✗ Satellite update timed out after {}s (attempt {}/{})",
+                        UPDATE_TIMEOUT_SECONDS,
+                        attempt,
+                        MAX_RETRIES
+                    );
                 }
             }
-        })
-    }
-    
-    /// 启动带初始更新的定时任务
-    /// 
-    /// 立即执行一次更新，然后启动定时任务
-    pub async fn start_with_initial_update(self) -> Result<tokio::task::JoinHandle<()>> {
-        info!("Running initial satellite update");
-        
-        // 先执行一次更新
-        match self.manager.update_all_satellites().await {
-            Ok(_) => {
-                let (total, active) = self.manager.get_satellite_count().await;
-                info!(
-                    "Initial update completed: {} total, {} active",
-                    total, active
+
+            // Retry if not last attempt
+            if attempt < MAX_RETRIES {
+                let delay = Duration::from_secs(RETRY_DELAY_SECONDS * attempt as u64);
+                tracing::info!("Retrying in {:?}...", delay);
+                tokio::time::sleep(delay).await;
+            } else {
+                tracing::error!(
+                    "Satellite update failed after {} attempts, giving up",
+                    MAX_RETRIES
                 );
             }
-            Err(e) => {
-                error!("Initial update failed: {}", e);
-            }
         }
-        
-        // 启动定时任务
-        Ok(self.start())
+    }
+
+    /// Calculate next trigger time based on update interval
+    /// 
+    /// If interval is <= 15 minutes: triggers at 02, 17, 32, 47 past the hour
+    /// Otherwise: triggers every N minutes from now
+    fn calculate_next_trigger(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        if self.update_interval_minutes <= 15 {
+            // Use fixed-minute schedule (02, 17, 32, 47)
+            self.calculate_fixed_minute_trigger(now)
+        } else {
+            // Use simple interval
+            now + chrono::Duration::minutes(self.update_interval_minutes as i64)
+        }
+    }
+
+    /// Calculate next trigger for fixed-minute schedule
+    /// Updates at: xx:02, xx:17, xx:32, xx:47
+    fn calculate_fixed_minute_trigger(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        let current_minute = now.minute();
+
+        let next_minute = match current_minute {
+            0..=1 => 2,
+            2..=16 => 17,
+            17..=31 => 32,
+            32..=46 => 47,
+            _ => {
+                // 47..=59, wrap to next hour at 02
+                return now
+                    .with_hour((now.hour() + 1) % 24)
+                    .unwrap()
+                    .with_minute(2)
+                    .unwrap()
+                    .with_second(0)
+                    .unwrap()
+                    .with_nanosecond(0)
+                    .unwrap();
+            }
+        };
+
+        now.with_minute(next_minute)
+            .unwrap()
+            .with_second(0)
+            .unwrap()
+            .with_nanosecond(0)
+            .unwrap()
+    }
+}
+
+/// Helper function to create and start updater
+pub async fn start_satellite_updater(
+    manager: Arc<SatelliteManager>,
+    update_interval_minutes: u64,
+    initial_update: bool,
+) -> anyhow::Result<JoinHandle<()>> {
+    let updater = SatelliteUpdater::new(manager, update_interval_minutes);
+
+    if initial_update {
+        updater.start_with_initial_update().await
+    } else {
+        updater.start().await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
-    use tempfile::TempDir;
-    
-    #[tokio::test]
-    async fn test_updater_creation() {
-        let temp_dir = TempDir::new().unwrap();
+    use chrono::TimeZone;
+
+    #[test]
+    fn test_calculate_fixed_minute_trigger() {
         let manager = Arc::new(
-            SatelliteManager::new(temp_dir.path(), 10).unwrap()
+            SatelliteManager::new(std::env::temp_dir().join("test"), 10).unwrap()
         );
-        
-        manager.initialize().await.unwrap();
-        
         let updater = SatelliteUpdater::new(manager, 10);
-        
-        // 只测试创建，不实际运行定时任务
-        assert_eq!(updater.update_interval_minutes, 10);
+
+        // Test various times
+        let test_time = Utc.with_ymd_and_hms(2026, 2, 16, 10, 0, 0).unwrap();
+        let next = updater.calculate_fixed_minute_trigger(test_time);
+        assert_eq!(next.minute(), 2);
+
+        let test_time = Utc.with_ymd_and_hms(2026, 2, 16, 10, 15, 0).unwrap();
+        let next = updater.calculate_fixed_minute_trigger(test_time);
+        assert_eq!(next.minute(), 17);
+
+        let test_time = Utc.with_ymd_and_hms(2026, 2, 16, 10, 30, 0).unwrap();
+        let next = updater.calculate_fixed_minute_trigger(test_time);
+        assert_eq!(next.minute(), 32);
+
+        let test_time = Utc.with_ymd_and_hms(2026, 2, 16, 10, 50, 0).unwrap();
+        let next = updater.calculate_fixed_minute_trigger(test_time);
+        assert_eq!(next.minute(), 2);
+        assert_eq!(next.hour(), 11);
     }
 }

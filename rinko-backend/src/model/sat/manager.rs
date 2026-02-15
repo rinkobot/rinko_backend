@@ -1,268 +1,421 @@
-use anyhow::Result;
-use std::collections::HashMap;
-use std::path::Path;
+///! Satellite status manager - Core business logic
+use super::{
+    api_client, cache, scraper, search,
+    types::{
+        AmsatReport, SatelliteDataBlock, SatelliteEntry, SatelliteInfo, SatelliteList,
+        UpdateReport,
+    },
+};
+use anyhow::{Context, Result};
+use chrono::{DateTime, Duration, Timelike, Utc};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
 
-use super::api_client::AmsatApiClient;
-use super::cache::CacheManager;
-use super::types::{SatelliteEntry, SatelliteInfo, KNOWN_SATELLITES};
+const DATA_RETENTION_HOURS: i64 = 48; // Keep 48 hours of data
+const INACTIVE_THRESHOLD_HOURS: i64 = 168; // 7 days without data = inactive
+const API_REQUEST_DELAY_MS: u64 = 200; // Delay between API requests
 
-/// 卫星状态管理器
+/// Satellite manager - main coordinator
 pub struct SatelliteManager {
-    /// API 客户端
-    api_client: AmsatApiClient,
-    
-    /// 缓存管理器
-    cache_manager: CacheManager,
-    
-    /// 卫星数据（内存缓存）
     satellites: Arc<RwLock<HashMap<String, SatelliteInfo>>>,
-    
-    /// 更新间隔（分钟）
+    satellite_list: Arc<RwLock<SatelliteList>>,
+    cache_dir: PathBuf,
     update_interval_minutes: i64,
 }
 
 impl SatelliteManager {
-    /// 创建新的卫星管理器
-    /// 
-    /// # Arguments
-    /// * `cache_dir` - 缓存目录路径
-    /// * `update_interval_minutes` - 更新间隔（分钟）
-    pub fn new<P: AsRef<Path>>(
-        cache_dir: P,
-        update_interval_minutes: i64,
-    ) -> Result<Self> {
-        let api_client = AmsatApiClient::new()?;
-        let cache_manager = CacheManager::new(cache_dir)?;
-        
-        Ok(Self {
-            api_client,
-            cache_manager,
+    /// Create a new satellite manager
+    pub fn new(cache_dir: impl AsRef<Path>, update_interval_minutes: i64) -> Result<Arc<Self>> {
+        let cache_dir = cache_dir.as_ref().to_path_buf();
+
+        Ok(Arc::new(Self {
             satellites: Arc::new(RwLock::new(HashMap::new())),
+            satellite_list: Arc::new(RwLock::new(SatelliteList::default())),
+            cache_dir,
             update_interval_minutes,
-        })
+        }))
     }
-    
-    /// 初始化管理器（加载缓存数据）
+
+    /// Initialize manager - load cache and satellite list
     pub async fn initialize(&self) -> Result<()> {
-        info!("Initializing satellite manager...");
-        
-        // 确保缓存目录存在
-        self.cache_manager.ensure_cache_dir().await?;
-        
-        // 加载缓存数据
-        match self.cache_manager.load_cache().await {
-            Ok(cached_satellites) => {
-                if !cached_satellites.is_empty() {
-                    let mut satellites = self.satellites.write().await;
-                    *satellites = cached_satellites;
-                    info!("Loaded {} satellites from cache", satellites.len());
-                } else {
-                    info!("No cached data found, initializing with known satellites");
-                    self.initialize_known_satellites().await?;
-                }
-            }
-            Err(e) => {
-                warn!("Failed to load cache: {}, initializing fresh", e);
-                self.initialize_known_satellites().await?;
-            }
+        tracing::info!("Initializing satellite manager...");
+
+        // Load satellite list
+        let list = cache::load_satellite_list(&self.cache_dir)
+            .await
+            .context("Failed to load satellite list")?;
+
+        // If list is empty, populate it with known satellites
+        if list.satellites.is_empty() {
+            tracing::info!("Satellite list is empty, fetching from AMSAT...");
+            self.initialize_satellite_list().await?;
+        } else {
+            *self.satellite_list.write().await = list;
+            tracing::info!(
+                "Loaded {} satellites from configuration",
+                self.satellite_list.read().await.satellites.len()
+            );
         }
-        
-        // 导出卫星列表
-        self.export_satellite_list().await?;
-        
-        info!("Satellite manager initialized successfully");
-        Ok(())
-    }
-    
-    /// 初始化已知卫星列表
-    async fn initialize_known_satellites(&self) -> Result<()> {
+
+        // Load satellite cache
+        let cached_satellites = cache::load_satellite_cache(&self.cache_dir)
+            .await
+            .context("Failed to load satellite cache")?;
+
         let mut satellites = self.satellites.write().await;
-        
-        for &name in KNOWN_SATELLITES.iter() {
-            if !satellites.contains_key(name) {
-                satellites.insert(name.to_string(), SatelliteInfo::new(name.to_string()));
-            }
+        for sat in cached_satellites {
+            satellites.insert(sat.name.clone(), sat);
         }
-        
-        info!("Initialized {} known satellites", satellites.len());
+
+        tracing::info!(
+            "Loaded {} satellites from cache",
+            satellites.len()
+        );
+
         Ok(())
     }
-    
-    /// 更新所有卫星状态
-    pub async fn update_all_satellites(&self) -> Result<()> {
-        info!("Starting full satellite update...");
-        
-        let satellite_names: Vec<String> = {
-            let satellites = self.satellites.read().await;
-            satellites.keys().cloned().collect()
-        };
-        
-        info!("Updating {} satellites", satellite_names.len());
-        
-        let results = self
-            .api_client
-            .fetch_multiple_satellites(&satellite_names, Some(96))
-            .await;
-        
-        let mut update_count = 0;
-        let mut error_count = 0;
-        
-        {
-            let mut satellites = self.satellites.write().await;
-            
-            for (name, result) in results {
-                match result {
-                    Ok(reports) => {
-                        if let Some(sat) = satellites.get_mut(&name) {
-                            sat.update_reports(reports);
-                            update_count += 1;
-                        }
+
+    /// Initialize satellite list from AMSAT
+    async fn initialize_satellite_list(&self) -> Result<()> {
+        let sat_names = scraper::fetch_satellite_names_with_fallback().await;
+
+        let mut list = SatelliteList::default();
+        for name in sat_names {
+            list.satellites.push(SatelliteEntry::new(name));
+        }
+
+        cache::save_satellite_list(&self.cache_dir, &list).await?;
+        *self.satellite_list.write().await = list;
+
+        tracing::info!(
+            "Initialized satellite list with {} satellites",
+            self.satellite_list.read().await.satellites.len()
+        );
+
+        Ok(())
+    }
+
+    /// Update all satellites (called by updater)
+    pub async fn update_all_satellites(&self) -> Result<UpdateReport> {
+        let start_time = std::time::Instant::now();
+        let mut report = UpdateReport::new();
+
+        tracing::info!("Starting satellite data update...");
+
+        // Fetch latest satellite names from AMSAT
+        let current_sat_names = scraper::fetch_satellite_names_with_fallback().await;
+
+        // Update satellite list
+        let mut list = self.satellite_list.write().await;
+        for sat_name in &current_sat_names {
+            if !list.satellites.iter().any(|s| &s.official_name == sat_name) {
+                tracing::info!("New satellite discovered: {}", sat_name);
+                list.satellites.push(SatelliteEntry::new(sat_name));
+                report.new_satellites.push(sat_name.clone());
+            }
+        }
+        report.total_satellites = list.satellites.len();
+
+        // Save updated list
+        cache::save_satellite_list(&self.cache_dir, &list).await?;
+
+        // Collect satellite names to update
+        let sat_names_to_update: Vec<String> = list
+            .satellites
+            .iter()
+            .map(|s| s.official_name.clone())
+            .collect();
+
+        // Release the lock
+        drop(list);
+
+        // Fetch data for all satellites
+        let fetch_results = api_client::batch_fetch_satellites(
+            &sat_names_to_update,
+            1, // Fetch last 1 hour
+            API_REQUEST_DELAY_MS,
+        )
+        .await;
+
+        // Update each satellite
+        let mut satellites = self.satellites.write().await;
+        for sat_name in sat_names_to_update {
+            let fetch_result = fetch_results.get(&sat_name);
+
+            let existing = satellites.get(&sat_name).cloned();
+            let was_active = existing.as_ref().map_or(true, |s| s.is_active);
+            match self.update_single_satellite(&sat_name, existing, fetch_result).await {
+                Ok(updated_sat) => {
+                    // Check if satellite became inactive
+                    if !updated_sat.is_active && was_active {
+                        report.inactive_satellites.push(sat_name.clone());
                     }
-                    Err(e) => {
-                        error!("Failed to update satellite '{}': {}", name, e);
-                        if let Some(sat) = satellites.get_mut(&name) {
-                            sat.mark_fetch_failed();
-                        }
-                        error_count += 1;
-                    }
+
+                    satellites.insert(sat_name, updated_sat);
+                    report.successful_updates += 1;
+                }
+                Err(e) => {
+                    tracing::error!("Failed to update {}: {}", sat_name, e);
+                    report.failed_updates += 1;
                 }
             }
         }
-        
-        info!(
-            "Update completed: {} updated, {} errors",
-            update_count, error_count
+
+        // Save cache
+        let sat_vec: Vec<SatelliteInfo> = satellites.values().cloned().collect();
+        cache::save_satellite_cache(&self.cache_dir, &sat_vec).await?;
+
+        report.duration_seconds = start_time.elapsed().as_secs_f64();
+
+        tracing::info!(
+            "Update complete: {} successful, {} failed in {:.2}s",
+            report.successful_updates,
+            report.failed_updates,
+            report.duration_seconds
         );
-        
-        // 保存到缓存
-        self.save_cache().await?;
-        
-        // 导出卫星列表
-        self.export_satellite_list().await?;
-        
-        Ok(())
+
+        if !report.new_satellites.is_empty() {
+            tracing::info!("New satellites: {:?}", report.new_satellites);
+        }
+        if !report.inactive_satellites.is_empty() {
+            tracing::warn!("Inactive satellites: {:?}", report.inactive_satellites);
+        }
+
+        Ok(report)
     }
-    
-    /// 更新单个卫星
-    pub async fn update_satellite(&self, name: &str) -> Result<()> {
-        debug!("Updating satellite '{}'", name);
-        
-        let reports = self.api_client.fetch_satellite_status(name, Some(96)).await?;
-        
-        {
-            let mut satellites = self.satellites.write().await;
-            
-            if let Some(sat) = satellites.get_mut(name) {
-                sat.update_reports(reports);
-            } else {
-                // 自动添加新卫星
-                let mut new_sat = SatelliteInfo::new(name.to_string());
-                new_sat.update_reports(reports);
-                satellites.insert(name.to_string(), new_sat);
-                info!("Auto-added new satellite: {}", name);
+
+    /// Update a single satellite
+    async fn update_single_satellite(
+        &self,
+        sat_name: &str,
+        existing: Option<SatelliteInfo>,
+        fetch_result: Option<&Result<Vec<AmsatReport>>>,
+    ) -> Result<SatelliteInfo> {
+        let mut info = existing.unwrap_or_else(|| SatelliteInfo::new(sat_name));
+
+        // Copy aliases from satellite list
+        let list = self.satellite_list.read().await;
+        if let Some(entry) = list.satellites.iter().find(|s| s.official_name == sat_name) {
+            info.aliases = entry.aliases.clone();
+            info.catalog_number = entry.catalog_number.clone();
+        }
+        drop(list);
+
+        // Process fetch result
+        match fetch_result {
+            Some(Ok(new_reports)) if !new_reports.is_empty() => {
+                // Successful fetch
+                info.data_blocks = Self::merge_reports(info.data_blocks, new_reports.clone());
+                info.last_fetch_success = Some(Utc::now());
+                info.amsat_update_status = true;
+            }
+            Some(Ok(_)) => {
+                // Empty result
+                info.amsat_update_status = true;
+            }
+            Some(Err(_)) | None => {
+                // Fetch failed
+                info.amsat_update_status = false;
             }
         }
-        
-        Ok(())
+
+        // Clean up old data (keep only last 48 hours)
+        Self::clean_old_data(&mut info.data_blocks, DATA_RETENTION_HOURS);
+
+        // Update metadata
+        info.last_updated = Utc::now();
+
+        // Determine if satellite is active
+        info.is_active = if let Some(last_success) = info.last_fetch_success {
+            (Utc::now() - last_success).num_hours() <= INACTIVE_THRESHOLD_HOURS
+        } else {
+            false
+        };
+
+        Ok(info)
     }
-    
-    /// 保存缓存
-    async fn save_cache(&self) -> Result<()> {
-        let satellites = self.satellites.read().await;
-        self.cache_manager.save_cache(&satellites).await
-    }
-    
-    /// 导出卫星列表
-    async fn export_satellite_list(&self) -> Result<()> {
-        let satellites = self.satellites.read().await;
-        self.cache_manager.export_satellite_list(&satellites).await
-    }
-    
-    /// 查询卫星
-    pub async fn query_satellite(&self, query: &str) -> Result<Option<SatelliteInfo>> {
-        // 首先从本地列表搜索
-        let search_results = self.cache_manager.search_satellites(query).await?;
-        
-        if search_results.is_empty() {
-            debug!("No satellites found for query '{}'", query);
-            return Ok(None);
+
+    /// Merge new reports into existing data blocks
+    fn merge_reports(
+        existing: Vec<SatelliteDataBlock>,
+        new_reports: Vec<AmsatReport>,
+    ) -> Vec<SatelliteDataBlock> {
+        let mut grouped: BTreeMap<String, Vec<AmsatReport>> = BTreeMap::new();
+
+        // Group existing reports
+        for block in existing {
+            grouped
+                .entry(block.time.clone())
+                .or_default()
+                .extend(block.reports);
         }
-        
-        // 取第一个匹配结果
-        let entry = &search_results[0];
-        
-        // 从缓存中获取完整信息
+
+        // Add new reports
+        for report in new_reports {
+            // Parse and normalize time to hour block
+            if let Ok(datetime) = DateTime::parse_from_rfc3339(&report.reported_time) {
+                let utc_time = datetime.with_timezone(&Utc);
+
+                // Skip future reports (with 5 min tolerance)
+                if utc_time > Utc::now() + Duration::minutes(5) {
+                    continue;
+                }
+
+                // Round down to hour
+                let hour_block = utc_time
+                    .with_minute(0)
+                    .unwrap()
+                    .with_second(0)
+                    .unwrap()
+                    .with_nanosecond(0)
+                    .unwrap()
+                    .to_rfc3339();
+
+                grouped.entry(hour_block).or_default().push(report);
+            }
+        }
+
+        // Remove duplicates within each block (by callsign)
+        for reports in grouped.values_mut() {
+            let mut seen: HashSet<String> = HashSet::new();
+            reports.retain(|report| {
+                if seen.contains(&report.callsign) {
+                    false
+                } else {
+                    seen.insert(report.callsign.clone());
+                    true
+                }
+            });
+        }
+
+        // Convert back to Vec and sort by time (descending)
+        let mut blocks: Vec<SatelliteDataBlock> = grouped
+            .into_iter()
+            .map(|(time, reports)| SatelliteDataBlock { time, reports })
+            .collect();
+
+        blocks.sort_by(|a, b| b.time.cmp(&a.time));
+
+        blocks
+    }
+
+    /// Clean old data blocks (older than retention period)
+    fn clean_old_data(blocks: &mut Vec<SatelliteDataBlock>, retention_hours: i64) {
+        let cutoff = Utc::now() - Duration::hours(retention_hours);
+
+        blocks.retain(|block| {
+            if let Ok(block_time) = DateTime::parse_from_rfc3339(&block.time) {
+                block_time.with_timezone(&Utc) >= cutoff
+            } else {
+                false
+            }
+        });
+    }
+
+    /// Query a single satellite by name
+    pub async fn query_satellite(&self, name: &str) -> Result<Option<SatelliteInfo>> {
+        // First try exact match
         let satellites = self.satellites.read().await;
-        Ok(satellites.get(&entry.name).cloned())
+        if let Some(sat) = satellites.get(name) {
+            return Ok(Some(sat.clone()));
+        }
+
+        // Try searching
+        let list = self.satellite_list.read().await;
+        let matches = search::search_satellites(name, &list, search::DEFAULT_THRESHOLD);
+
+        if let Some(first_match) = matches.first() {
+            Ok(satellites.get(first_match).cloned())
+        } else {
+            Ok(None)
+        }
     }
-    
-    /// 搜索卫星（返回多个匹配）
-    pub async fn search_satellites(&self, query: &str) -> Result<Vec<SatelliteEntry>> {
-        self.cache_manager.search_satellites(query).await
+
+    /// Search for satellites (returns multiple matches)
+    pub async fn search_satellites(&self, query: &str) -> Result<Vec<SatelliteInfo>> {
+        let list = self.satellite_list.read().await;
+        let matches = search::search_multiple(query, &list, search::DEFAULT_THRESHOLD);
+
+        let satellites = self.satellites.read().await;
+        let mut results = Vec::new();
+
+        for sat_name in matches {
+            if let Some(sat) = satellites.get(&sat_name) {
+                results.push(sat.clone());
+            }
+        }
+
+        Ok(results)
     }
-    
-    /// 获取所有活跃卫星
+
+    /// Get all active satellites
     pub async fn get_active_satellites(&self) -> Vec<SatelliteInfo> {
         let satellites = self.satellites.read().await;
         satellites
             .values()
-            .filter(|sat| sat.is_active)
+            .filter(|s| s.is_active)
             .cloned()
             .collect()
     }
-    
-    /// 获取卫星总数
-    pub async fn get_satellite_count(&self) -> (usize, usize) {
+
+    /// Get all satellites (including inactive)
+    pub async fn get_all_satellites(&self) -> Vec<SatelliteInfo> {
         let satellites = self.satellites.read().await;
-        let total = satellites.len();
-        let active = satellites.values().filter(|sat| sat.is_active).count();
-        (total, active)
+        satellites.values().cloned().collect()
     }
-    
-    /// 剔除非活跃卫星（可选功能）
-    pub async fn prune_inactive_satellites(&self, days_threshold: i64) -> Result<usize> {
-        let mut satellites = self.satellites.write().await;
-        let mut removed = 0;
-        
-        let threshold = chrono::Utc::now() - chrono::Duration::days(days_threshold);
-        
-        satellites.retain(|name, sat| {
-            if let Some(last_success) = sat.last_fetch_success {
-                if last_success < threshold && !sat.is_active {
-                    info!("Pruning inactive satellite: {}", name);
-                    removed += 1;
-                    return false;
-                }
-            }
-            true
-        });
-        
-        if removed > 0 {
-            info!("Pruned {} inactive satellites", removed);
-            self.save_cache().await?;
-            self.export_satellite_list().await?;
-        }
-        
-        Ok(removed)
+
+    /// Reload satellite list from file (for hot reload)
+    pub async fn reload_satellite_list(&self) -> Result<()> {
+        tracing::info!("Reloading satellite list from file...");
+
+        let list = cache::load_satellite_list(&self.cache_dir).await?;
+        *self.satellite_list.write().await = list;
+
+        tracing::info!(
+            "Reloaded {} satellites from configuration",
+            self.satellite_list.read().await.satellites.len()
+        );
+
+        Ok(())
+    }
+
+    /// Get update interval in minutes
+    pub fn update_interval_minutes(&self) -> i64 {
+        self.update_interval_minutes
+    }
+
+    /// Get cache directory path
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-    
+
     #[tokio::test]
-    async fn test_satellite_manager_initialization() {
-        let temp_dir = TempDir::new().unwrap();
-        let manager = SatelliteManager::new(temp_dir.path(), 10).unwrap();
-        
-        manager.initialize().await.unwrap();
-        
-        let (total, active) = manager.get_satellite_count().await;
-        assert!(total > 0);
+    async fn test_manager_creation() {
+        let temp_dir = std::env::temp_dir().join("rinko_test_manager");
+        let manager = SatelliteManager::new(&temp_dir, 10).unwrap();
+        assert_eq!(manager.update_interval_minutes(), 10);
+    }
+
+    #[tokio::test]
+    async fn test_merge_reports() {
+        let existing = vec![];
+        let new_reports = vec![AmsatReport {
+            name: "AO-91".to_string(),
+            reported_time: "2026-02-16T08:15:00Z".to_string(),
+            callsign: "BG2DNN".to_string(),
+            report: "Heard".to_string(),
+            grid_square: "OM89".to_string(),
+        }];
+
+        let merged = SatelliteManager::merge_reports(existing, new_reports);
+        assert!(!merged.is_empty());
+        assert_eq!(merged[0].reports. len(), 1);
     }
 }
