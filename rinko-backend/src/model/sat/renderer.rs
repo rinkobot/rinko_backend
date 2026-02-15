@@ -4,6 +4,50 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Timelike, Utc};
 use std::path::{Path, PathBuf};
 
+/// Map time difference to color gradient (green -> yellow -> red)
+/// Based on hours difference between target time and now
+fn map_time_to_color(target_time: &str, now_utc: &DateTime<Utc>, min_hours: f64, max_hours: f64) -> Result<String> {
+    // Parse target time
+    let target = DateTime::parse_from_rfc3339(target_time)
+        .context("Failed to parse target time")?;
+    let target_utc = target.with_timezone(&Utc);
+
+    // Calculate hour difference
+    let delta_hours = (now_utc.signed_duration_since(target_utc)).num_seconds().abs() as f64 / 3600.0;
+
+    // Color anchors
+    let green = (125u8, 227u8, 61u8);   // #7de33d - fresh
+    let yellow = (255u8, 255u8, 0u8);   // #ffff00 - medium
+    let red = (255u8, 0u8, 0u8);        // #ff0000 - stale
+
+    let (r, g, b) = if delta_hours <= min_hours {
+        green
+    } else if delta_hours >= max_hours {
+        red
+    } else {
+        let mid = (min_hours + max_hours) / 2.0;
+        if delta_hours <= mid {
+            // Interpolate green -> yellow
+            let t = (delta_hours - min_hours) / (mid - min_hours);
+            lerp_color(green, yellow, t)
+        } else {
+            // Interpolate yellow -> red
+            let t = (delta_hours - mid) / (max_hours - mid);
+            lerp_color(yellow, red, t)
+        }
+    };
+
+    Ok(format!("#{:02X}{:02X}{:02X}", r, g, b))
+}
+
+/// Linear color interpolation
+fn lerp_color(c1: (u8, u8, u8), c2: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
+    let r = (c1.0 as f64 + (c2.0 as f64 - c1.0 as f64) * t).round() as u8;
+    let g = (c1.1 as f64 + (c2.1 as f64 - c1.1 as f64) * t).round() as u8;
+    let b = (c1.2 as f64 + (c2.2 as f64 - c1.2 as f64) * t).round() as u8;
+    (r, g, b)
+}
+
 const SVG_TEMPLATE: &str = include_str!("../../../resources/sat_template.svg");
 const BLOCK_TITLE_HEIGHT: f32 = 45.0;
 const HEADER_HEIGHT: f32 = 40.0;
@@ -172,9 +216,9 @@ impl SatelliteRenderer {
 
         // AMSAT update status
         let (status_class, status_text) = if sat.amsat_update_status {
-            ("amsat-update-success", "✓ AMSAT Update: Success")
+            ("amsat-update-success", "AMSAT Update: Success")
         } else {
-            ("amsat-update-failure", "✗ AMSAT Update: Failed")
+            ("amsat-update-failure", "AMSAT Update: Failed")
         };
 
         block.push_str(&format!(
@@ -252,12 +296,20 @@ impl SatelliteRenderer {
                     .unwrap_or_else(|_| Utc::now().into());
                 let hours_ago = (now_utc.signed_duration_since(report_time)).num_hours();
 
+                // Calculate time color (0-12 hours gradient: green -> yellow -> red)
+                let time_color = map_time_to_color(&report.reported_time, now_utc, 0.0, 12.0)
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("Failed to map time to color: {}", e);
+                        "#808080".to_string() // Default gray
+                    });
+
                 block.push_str(&format!(
                     r##"<g class="data-row">
    <text x="{}" y="{}" class="table-text">{}</text>
    <text x="{}" y="{}" class="table-text">{}</text>
    <rect x="{}" y="{}" width="{}" height="{}" fill="{}" rx="1" />
    <text x="{}" y="{}" class="table-text">{}</text>
+   <rect x="{}" y="{}" width="{}" height="{}" fill="{}" rx="1" />
    <text x="{}" y="{}" class="table-text">{} ({}h ago)</text>
 </g>
 "##,
@@ -276,6 +328,11 @@ impl SatelliteRenderer {
                     y_pos,
                     report_text,
                     X_TIME,
+                    y_pos - COLOR_BLOCK_HEIGHT / 2.0,
+                    COLOR_BLOCK_WIDTH,
+                    COLOR_BLOCK_HEIGHT,
+                    time_color,
+                    X_TIME + COLOR_BLOCK_WIDTH + COLOR_BLOCK_TEXT_SPACING,
                     y_pos,
                     report.reported_time,
                     hours_ago
@@ -325,9 +382,18 @@ impl SatelliteRenderer {
         use resvg::render;
         use usvg::{Options, Transform, Tree};
         use tiny_skia::Pixmap;
+        use fontdb::Database;
 
-        // Parse SVG
-        let options = Options::default();
+        // Load fonts from fonts directory
+        let mut fontdb = Database::new();
+        fontdb.load_fonts_dir("fonts");
+        tracing::debug!("Loaded {} font faces from fonts directory", fontdb.len());
+
+        // Parse SVG with font database
+        let mut options = Options::default();
+        options.font_family = "Consolas".to_string();
+        options.fontdb = std::sync::Arc::new(fontdb);
+        
         let tree = Tree::from_str(svg_content, &options)
             .context("Failed to parse SVG")?;
 
