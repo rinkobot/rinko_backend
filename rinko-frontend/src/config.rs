@@ -12,6 +12,8 @@ pub struct QQConfig {
     pub app_id: String,
     pub client_secret: String,       // also used as bot_secret for webhook signature verification
     pub access_token: String,
+    #[serde(default)]
+    pub media_base_url: Option<String>,  // Base URL for media server (e.g., "https://media.rinkosoft.me/media")
     #[serde(skip)]
     pub token_expires_in: u64,       // expire time in seconds
     #[serde(skip)]

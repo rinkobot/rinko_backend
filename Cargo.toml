@@ -4,6 +4,7 @@ members = [
     "rinko-common",
     "rinko-frontend",
     "rinko-backend",
+    "rinko-media-server",
 ]
 
 [workspace.package]

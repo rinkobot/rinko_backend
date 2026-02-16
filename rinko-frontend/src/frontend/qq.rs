@@ -1,6 +1,8 @@
 use crate::{config::QQConfig, utils::BotAdapter};
 use crate::utils::*;
 use crate::backend::connection_manager::BackendConnectionManager;
+use rinko_common::proto::MessageResponse;
+use rinko_common::proto::ContentType;
 use uuid::Uuid;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -290,13 +292,7 @@ async fn handle_group_at_message(
                         // If backend returns a response message, send it
                         if !response.message.is_empty() && response.message != "OK" {
                             let config = qq_config.read().await;
-                            let _ = config.send_group_message(
-                                &msg_event.group_openid,
-                                &response.message,
-                                Some(msg_event.id.clone()),
-                                event_id.clone(),
-                                Some(1),
-                            ).await;
+                            let _ = config.send_message(response, &msg_event).await;
                         }
                         
                         // Backend handled the message, return early
@@ -616,10 +612,14 @@ impl QQConfig {
     /// 
     /// # Parameters
     /// - `group_openid`: The openid of the target group
-    /// - `local_path`: Path to the local image file
+    /// - `local_path`: Path to the local image file (e.g., "../rinko-backend/data/satellite_cache/rendered_images/sat_123.png")
     /// - `msg_id`: Optional message ID for passive reply
     /// - `event_id`: Optional event ID for passive message
     /// - `msg_seq`: Optional message sequence number
+    /// 
+    /// # Notes
+    /// - Requires `media_base_url` to be configured in config.toml
+    /// - Extracts filename from local_path and constructs public URL
     pub async fn send_group_image(
         &self,
         group_openid: &str,
@@ -628,17 +628,26 @@ impl QQConfig {
         event_id: Option<String>,
         msg_seq: Option<u32>,
     ) -> anyhow::Result<SendMessageResponse> {
-        // For local files, we need to provide a URL accessible by QQ servers
-        // In production, you would upload to a CDN or temporary hosting
-        // For now, we'll use a public URL as a placeholder
+        // Extract filename from local path
+        let filename = std::path::Path::new(local_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", local_path))?;
         
-        // TODO: Implement actual file upload or local HTTP server
-        // For testing, you need to replace this with an actual accessible URL
-        let image_url = "https://metasequoiani.com/_astro/image.BnwkcnDf_Z2vIi4L.webp"; // Replace with actual URL
+        // Construct public URL using media_base_url from config
+        let image_url = if let Some(base_url) = &self.media_base_url {
+            format!("{}/{}", base_url.trim_end_matches('/'), filename)
+        } else {
+            // Fallback: use placeholder if media_base_url is not configured
+            tracing::warn!(
+                "media_base_url not configured in config.toml. Using placeholder URL."
+            );
+            "https://metasequoiani.com/_astro/image.BnwkcnDf_Z2vIi4L.webp".to_string()
+        };
         
-        tracing::warn!(
-            "Local file path '{}' needs to be accessible via URL. Using placeholder: {}",
-            local_path,
+        tracing::info!(
+            "Sending image '{}' to group via URL: {}",
+            filename,
             image_url
         );
         
@@ -646,7 +655,7 @@ impl QQConfig {
         let upload_response = self.upload_group_media(
             group_openid,
             1, // 1 = image
-            image_url,
+            &image_url,
             false, // Don't send directly, get file_info for flexible usage
         ).await?;
 
@@ -712,5 +721,42 @@ impl QQConfig {
         );
 
         Ok(response)
+    }
+
+    async fn send_message(&self, resp: MessageResponse, msg_event: &GroupMessageEvent) -> anyhow::Result<()> {
+        match resp.content_type {
+            ct if ct == ContentType::Text as i32 => {
+                self.send_group_message(
+                    &msg_event.group_openid,
+                    &resp.message,
+                    None,
+                    None,
+                    Some(1),
+                ).await?;
+            }
+            ct if ct == ContentType::Image as i32 => {
+                // For image messages, the message field contains the file path
+                let local_path = resp.message.strip_prefix("file:///").unwrap_or(&resp.message);
+                self.send_group_image(
+                    &msg_event.group_openid,
+                    local_path,
+                    None,
+                    None,
+                    Some(1),
+                ).await?;
+            }
+            _ => {
+                tracing::warn!("Unsupported content type: {}", resp.content_type);
+                // Fallback to sending as text
+                self.send_group_message(
+                    &msg_event.group_openid,
+                    "[Unsupported content type]",
+                    None,
+                    None,
+                    Some(1),
+                ).await?;
+            }
+        }
+        Ok(())
     }
 }

@@ -1,0 +1,23 @@
+[package]
+name = "rinko-media-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rinko-media-server"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace shared dependencies
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+
+# Additional dependencies
+tower-http = { version = "0.6.2", features = ["fs", "trace", "cors"] }

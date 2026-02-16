@@ -61,7 +61,6 @@ impl MessageHandler {
     ) -> Result<MessageResponse> {
         match command {
             "q" | "query" => self.amsat_query(args).await,
-            "sat" | "satellite" => self.amsat_query(args).await,
             _ => {
                 Ok(MessageResponse {
                     success: false,
