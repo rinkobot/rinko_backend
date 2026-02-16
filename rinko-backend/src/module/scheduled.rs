@@ -90,7 +90,7 @@ impl ScheduledTaskManager {
     pub async fn start_dx_world_scraper_loop(&self) -> anyhow::Result<JoinHandle<()>> {
         tracing::info!("Starting DX World scraper loop (every 6 hours)...");
         let handle = tokio::spawn(async move {
-            let scraper = DxWorldScraper::new(None);
+            let scraper = DxWorldScraper::new(None, None);
             loop {
                 match scraper.fetch_and_save().await {
                     Ok(_) => tracing::info!("DX World scraper completed successfully"),
@@ -280,6 +280,23 @@ impl ScheduledTaskManager {
                 }
                 Err(e) => {
                     tracing::error!("Image cleanup failed: {}", e);
+                }
+            }
+
+            // Run cleanup for DX World files as well
+            match super::dx_world::dx_world::cleanup_old_dx_world_files(
+                &std::path::PathBuf::from("data/dx_world"),
+                retention_days
+            ).await {
+                Ok(deleted_count) => {
+                    if deleted_count > 0 {
+                        tracing::info!("DX World file cleanup completed: deleted {} old files", deleted_count);
+                    } else {
+                        tracing::debug!("DX World file cleanup completed: no old files to delete");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("DX World file cleanup failed: {}", e);
                 }
             }
         }

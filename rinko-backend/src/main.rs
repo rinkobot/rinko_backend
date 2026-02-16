@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
 
     // Initialize satellite manager
     tracing::info!("Initializing satellite manager...");
-    let cache_dir = "data/satellite_cache";
+    let cache_dir = "data";
     let update_interval_minutes = 10; // Update every 10 minutes
     
     let satellite_manager = SatelliteManager::new(cache_dir, update_interval_minutes as i64)?;

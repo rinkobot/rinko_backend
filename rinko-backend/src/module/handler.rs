@@ -64,7 +64,7 @@ impl MessageHandler {
             "dxw" => {
                 Ok(MessageResponse {
                     success: true,
-                    message: "data/dx_world/latest.png".to_string(),
+                    message: "data/image_cache/dxw_latest.png".to_string(),
                     message_id: uuid::Uuid::now_v7().to_string(),
                     content_type: rinko_common::proto::ContentType::Image as i32,
                 })
@@ -110,7 +110,8 @@ impl MessageHandler {
         
         // Try to render as image
         let cache_dir = self.satellite_manager.cache_dir();
-        let images_dir = cache_dir.join("rendered_images");
+        // image_path is like: cache_dir/../iamge_cache/sat_name.png
+        let images_dir = cache_dir.parent().unwrap().join("image_cache");
         let renderer = SatelliteRenderer::new(&images_dir);
         
         match renderer.render_satellites(&limited_satellites).await {

@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
+const SATELLITE_CACHE_PATH: &str = "satellite_cache";
 const SATELLITE_CACHE_FILE: &str = "satellite_cache.json";
 const SATELLITE_LIST_FILE: &str = "satellite_list.toml";
 
@@ -15,7 +16,7 @@ const SATELLITE_LIST_FILE: &str = "satellite_list.toml";
 /// # Returns
 /// Vec of SatelliteInfo on success, empty vec if file doesn't exist
 pub async fn load_satellite_cache(cache_dir: &Path) -> Result<Vec<SatelliteInfo>> {
-    let cache_path = cache_dir.join(SATELLITE_CACHE_FILE);
+    let cache_path = cache_dir.join(format!("{}/{}", SATELLITE_CACHE_PATH, SATELLITE_CACHE_FILE));
     
     if !cache_path.exists() {
         tracing::info!("Cache file not found at {:?}, starting fresh", cache_path);
@@ -52,7 +53,7 @@ pub async fn save_satellite_cache(
         .await
         .context(format!("Failed to create cache directory: {:?}", cache_dir))?;
     
-    let cache_path = cache_dir.join(SATELLITE_CACHE_FILE);
+    let cache_path = cache_dir.join(format!("{}/{}", SATELLITE_CACHE_PATH, SATELLITE_CACHE_FILE));
     
     let json = serde_json::to_string_pretty(satellites)
         .context("Failed to serialize satellite cache")?;
@@ -134,7 +135,7 @@ pub async fn save_satellite_list(cache_dir: &Path, list: &SatelliteList) -> Resu
 
 /// Get the path to the rendered images directory
 pub fn get_images_dir(cache_dir: &Path) -> PathBuf {
-    cache_dir.join("rendered_images")
+    cache_dir.join("image_cache")
 }
 
 /// Ensure the images directory exists
