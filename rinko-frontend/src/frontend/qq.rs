@@ -729,7 +729,7 @@ impl QQConfig {
                 self.send_group_message(
                     &msg_event.group_openid,
                     &resp.message,
-                    None,
+                    Some(msg_event.id.clone()),
                     None,
                     Some(1),
                 ).await?;
@@ -740,7 +740,7 @@ impl QQConfig {
                 self.send_group_image(
                     &msg_event.group_openid,
                     local_path,
-                    None,
+                    Some(msg_event.id.clone()),
                     None,
                     Some(1),
                 ).await?;
@@ -751,7 +751,7 @@ impl QQConfig {
                 self.send_group_message(
                     &msg_event.group_openid,
                     "[Unsupported content type]",
-                    None,
+                    Some(msg_event.id.clone()),
                     None,
                     Some(1),
                 ).await?;
