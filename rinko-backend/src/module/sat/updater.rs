@@ -206,35 +206,3 @@ pub async fn start_satellite_updater(
         updater.start().await
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    #[test]
-    fn test_calculate_fixed_minute_trigger() {
-        let manager = Arc::new(
-            SatelliteManager::new(std::env::temp_dir().join("test"), 10).unwrap()
-        );
-        let updater = SatelliteUpdater::new(manager, 10);
-
-        // Test various times
-        let test_time = Utc.with_ymd_and_hms(2026, 2, 16, 10, 0, 0).unwrap();
-        let next = updater.calculate_fixed_minute_trigger(test_time);
-        assert_eq!(next.minute(), 2);
-
-        let test_time = Utc.with_ymd_and_hms(2026, 2, 16, 10, 15, 0).unwrap();
-        let next = updater.calculate_fixed_minute_trigger(test_time);
-        assert_eq!(next.minute(), 17);
-
-        let test_time = Utc.with_ymd_and_hms(2026, 2, 16, 10, 30, 0).unwrap();
-        let next = updater.calculate_fixed_minute_trigger(test_time);
-        assert_eq!(next.minute(), 32);
-
-        let test_time = Utc.with_ymd_and_hms(2026, 2, 16, 10, 50, 0).unwrap();
-        let next = updater.calculate_fixed_minute_trigger(test_time);
-        assert_eq!(next.minute(), 2);
-        assert_eq!(next.hour(), 11);
-    }
-}

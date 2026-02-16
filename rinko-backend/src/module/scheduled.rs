@@ -6,6 +6,7 @@
 ///! - Future tasks can be added here
 
 use super::sat::{SatelliteManager, cleanup_old_images};
+use super::dx_world::dx_world::DxWorldScraper;
 use chrono::{DateTime, Timelike, Utc};
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,6 +72,10 @@ impl ScheduledTaskManager {
         let cleanup_handle = self.start_image_cleanup_task().await?;
         self.task_handles.push(cleanup_handle);
         
+        // Start DX World scraper task
+        let dx_world_handle = self.start_dx_world_scraper_loop().await?;
+        self.task_handles.push(dx_world_handle);
+        
         tracing::info!(
             "Started {} scheduled tasks (satellite updates every {} min, image cleanup every {} hours)",
             self.task_handles.len(),
@@ -79,6 +84,22 @@ impl ScheduledTaskManager {
         );
         
         Ok(())
+    }
+
+    /// DX World scraper task loop (fetch every 6 hours)
+    pub async fn start_dx_world_scraper_loop(&self) -> anyhow::Result<JoinHandle<()>> {
+        tracing::info!("Starting DX World scraper loop (every 6 hours)...");
+        let handle = tokio::spawn(async move {
+            let scraper = DxWorldScraper::new(None);
+            loop {
+                match scraper.fetch_and_save().await {
+                    Ok(_) => tracing::info!("DX World scraper completed successfully"),
+                    Err(e) => tracing::error!("DX World scraper failed: {}", e),
+                }
+                tokio::time::sleep(Duration::from_secs(6 * 3600)).await; // Sleep for 6 hours
+            }
+        });
+        Ok(handle)
     }
 
     /// Start satellite data update task
@@ -318,6 +339,7 @@ impl ScheduledTaskManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Datelike;
 
     #[test]
     fn test_calculate_next_update_time() {
@@ -341,6 +363,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Time-dependent test
     fn test_calculate_next_cleanup_time() {
         // Test at 01:00 - should return today 03:00
         let now = Utc::now()

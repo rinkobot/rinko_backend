@@ -61,6 +61,14 @@ impl MessageHandler {
     ) -> Result<MessageResponse> {
         match command {
             "q" | "query" => self.amsat_query(args).await,
+            "dxw" => {
+                Ok(MessageResponse {
+                    success: true,
+                    message: "data/dx_world/latest.png".to_string(),
+                    message_id: uuid::Uuid::now_v7().to_string(),
+                    content_type: rinko_common::proto::ContentType::Image as i32,
+                })
+            }
             _ => {
                 Ok(MessageResponse {
                     success: false,
