@@ -111,7 +111,7 @@ impl MessageHandler {
         // Try to render as image
         let cache_dir = self.satellite_manager.cache_dir();
         // image_path is like: cache_dir/../iamge_cache/sat_name.png
-        let images_dir = cache_dir.parent().unwrap().join("image_cache");
+        let images_dir = cache_dir.join("image_cache");
         let renderer = SatelliteRenderer::new(&images_dir);
         
         match renderer.render_satellites(&limited_satellites).await {
