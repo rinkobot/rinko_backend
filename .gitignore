@@ -10,5 +10,7 @@
 /*/target
 /*/config.toml
 /*/fonts
+Cargo.lock
+/*/Cargo.lock
 config.toml
 *.ps1
