@@ -226,13 +226,13 @@ impl SatelliteRenderer {
         let logo_y = *current_y + (ROW_HEIGHT - logo_size) / 2.0;
 
         block.push_str(&format!(
-            r#"<image x="{}" y="{}" width="{}" height="{}" href="../../../resources/amsat.png"/><text x="{}" y="{}" class="{}">{}</text>
+            r#"<image x="{}" y="{}" width="{}" height="{}" href="resources/amsat.png"/><text x="{}" y="{}" class="{}">{}</text>
 "#,
             logo_x,
             logo_y,
             logo_size,
             logo_size,
-            X_TIME,
+            logo_x + logo_size + 10.0,
             *current_y + ROW_HEIGHT / 2.0,
             status_class,
             status_text

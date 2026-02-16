@@ -9,5 +9,6 @@
 /*/runtime_data
 /*/target
 /*/config.toml
+/*/fonts
 config.toml
 *.ps1
