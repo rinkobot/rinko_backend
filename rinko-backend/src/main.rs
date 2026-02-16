@@ -1,6 +1,7 @@
 use rinko_backend::config;
 use rinko_backend::service;
-use rinko_backend::model::sat::{SatelliteManager, start_satellite_updater};
+use rinko_backend::module::sat::SatelliteManager;
+use rinko_backend::module::scheduled::{ScheduledTaskManager, ScheduledTaskConfig};
 
 use anyhow::Result;
 use tonic::transport::Server;
@@ -35,16 +36,18 @@ async fn main() -> Result<()> {
     satellite_manager.initialize().await?;
     tracing::info!("Satellite manager initialized successfully");
     
-    // Start satellite updater with initial update
-    let _updater_handle = start_satellite_updater(
-        satellite_manager.clone(),
-        update_interval_minutes,
-        true, // Perform initial update immediately
-    ).await?;
-    tracing::info!(
-        "Satellite updater started (interval: {} minutes, initial update: yes)",
-        update_interval_minutes
-    );
+    // Configure and start scheduled tasks
+    let task_config = ScheduledTaskConfig {
+        satellite_update_interval_minutes: update_interval_minutes,
+        image_cleanup_interval_hours: 24, // Clean images daily
+        image_retention_days: 1, // Keep images for 1 day
+        cache_dir: cache_dir.to_string(),
+        perform_initial_update: true, // Perform initial update immediately
+    };
+    
+    let mut task_manager = ScheduledTaskManager::new(task_config, satellite_manager.clone());
+    task_manager.start_all().await?;
+    tracing::info!("All scheduled tasks started successfully");
 
     // Create gRPC service with satellite manager
     let bot_service = BotBackendService::new(satellite_manager);

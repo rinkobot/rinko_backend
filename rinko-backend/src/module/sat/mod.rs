@@ -27,6 +27,7 @@ mod scraper;
 
 // Cache management
 mod cache;
+pub use cache::cleanup_old_images;
 
 // Search engine
 mod search;

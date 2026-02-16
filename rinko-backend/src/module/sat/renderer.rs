@@ -221,9 +221,17 @@ impl SatelliteRenderer {
             ("amsat-update-failure", "AMSAT Update: Failed")
         };
 
+        let logo_size = ROW_HEIGHT * 0.6;
+        let logo_x = X_TIME;
+        let logo_y = *current_y + (ROW_HEIGHT - logo_size) / 2.0;
+
         block.push_str(&format!(
-            r#"<text x="{}" y="{}" class="{}">{}</text>
+            r#"<image x="{}" y="{}" width="{}" height="{}" href="../../../resources/amsat.png"/><text x="{}" y="{}" class="{}">{}</text>
 "#,
+            logo_x,
+            logo_y,
+            logo_size,
+            logo_size,
             X_TIME,
             *current_y + ROW_HEIGHT / 2.0,
             status_class,
@@ -357,7 +365,7 @@ impl SatelliteRenderer {
             r##"    <g id="footer">
 <rect x="0" y="{}" width="100%" height="{}" fill="#f0f2f5" />
 <text x="50%" y="{}" class="table-text footer-text" text-anchor="middle">
-    Rinko Bot v0.1.0, rendered at {} BJT
+    Powered by Rinko, rendered at {} BJT
 </text>
 </g>
 "##,

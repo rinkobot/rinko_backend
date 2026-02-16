@@ -17,8 +17,8 @@ use rinko_common::proto::{
 };
 use rinko_common::Platform;
 
-use crate::model::handler::MessageHandler;
-use crate::model::sat::SatelliteManager;
+use crate::module::handler::MessageHandler;
+use crate::module::sat::SatelliteManager;
 
 /// Frontend connection info
 #[derive(Debug, Clone)]
