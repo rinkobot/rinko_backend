@@ -25,16 +25,16 @@ async fn main() -> Result<()> {
     tracing::info!("Rinko Backend starting...");
     tracing::info!("Server will listen on {}", config.server_address());
 
-    // Initialize satellite manager
-    tracing::info!("Initializing satellite manager...");
+    // Initialize satellite manager V2
+    tracing::info!("Initializing satellite manager (V2)...");
     let cache_dir = "data";
     let update_interval_minutes = 10; // Update every 10 minutes
     
-    let satellite_manager = SatelliteManager::new(cache_dir, update_interval_minutes as i64)?;
+    let satellite_manager = SatelliteManager::new(cache_dir, update_interval_minutes as i64).await?;
     
     // Initialize satellite manager (load cache and configuration)
     satellite_manager.initialize().await?;
-    tracing::info!("Satellite manager initialized successfully");
+    tracing::info!("Satellite manager (V2) initialized successfully");
     
     // Configure and start scheduled tasks
     let task_config = ScheduledTaskConfig {

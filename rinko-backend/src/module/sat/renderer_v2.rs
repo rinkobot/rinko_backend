@@ -1,10 +1,9 @@
-use crate::module::sat::SearchResult;
-
-///! Satellite status renderer - Multi-transponder support
+///! Satellite status renderer V2 - Multi-transponder support
 ///!
 ///! Generate images from V2 satellite data with transponder information
 
-use super::types::{Satellite, Transponder, ReportStatus, SatelliteDataBlock};
+use super::types_v2::{Satellite, Transponder};
+use super::shared_types::{ReportStatus, SatelliteDataBlock};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Timelike, Utc};
 use std::path::{Path, PathBuf};
@@ -65,12 +64,12 @@ fn lerp_color(c1: (u8, u8, u8), c2: (u8, u8, u8), t: f64) -> (u8, u8, u8) {
     (r, g, b)
 }
 
-/// Satellite renderer
-pub struct SatelliteRenderer {
+/// Satellite renderer V2
+pub struct SatelliteRendererV2 {
     output_dir: PathBuf,
 }
 
-impl SatelliteRenderer {
+impl SatelliteRendererV2 {
     /// Create a new renderer
     pub fn new(output_dir: impl AsRef<Path>) -> Self {
         Self {
@@ -78,13 +77,13 @@ impl SatelliteRenderer {
         }
     }
     
-    /// Render transponders to image
-    pub async fn render_transponders(&self, search_results: &Vec<SearchResult>) -> Result<PathBuf> {
+    /// Render satellites to image
+    pub async fn render_satellites(&self, satellites: &[Satellite]) -> Result<PathBuf> {
         tokio::fs::create_dir_all(&self.output_dir)
             .await
             .context("Failed to create output directory")?;
         
-        let filename = self.generate_filename(search_results);
+        let filename = self.generate_filename(satellites);
         let output_path = self.output_dir.join(&filename);
         
         if output_path.exists() {
@@ -92,7 +91,7 @@ impl SatelliteRenderer {
             return Ok(output_path);
         }
         
-        self.generate_image(search_results, &output_path).await?;
+        self.generate_image(satellites, &output_path).await?;
         
         tracing::info!("Generated satellite status image: {:?}", output_path);
         
@@ -100,7 +99,7 @@ impl SatelliteRenderer {
     }
     
     /// Generate filename
-    fn generate_filename(&self, search_results: &Vec<SearchResult>) -> String {
+    fn generate_filename(&self, satellites: &[Satellite]) -> String {
         let now = chrono::Utc::now();
         let minute = (now.minute() / 15) * 15;
         let floored = now
@@ -113,10 +112,10 @@ impl SatelliteRenderer {
         
         let time_str = floored.format("%Y%m%d_%H%M").to_string();
         
-        let sat_names: Vec<String> = search_results
+        let sat_names: Vec<String> = satellites
             .iter()
             .take(5)
-            .map(|s| Self::normalize_sat_name(&s.transponder.amsat_api_name))
+            .map(|s| Self::normalize_sat_name(&s.common_name))
             .collect();
         
         let sat_part = if sat_names.is_empty() {
@@ -138,27 +137,26 @@ impl SatelliteRenderer {
     }
     
     /// Generate image
-    async fn generate_image(&self, search_results: &Vec<SearchResult>, output_path: &Path) -> Result<()> {
-        let svg_content = self.generate_svg(search_results)?;
+    async fn generate_image(&self, satellites: &[Satellite], output_path: &Path) -> Result<()> {
+        let svg_content = self.generate_svg(satellites)?;
         self.render_svg_to_png(&svg_content, output_path).await?;
         Ok(())
     }
     
     /// Generate SVG content
-    fn generate_svg(&self, search_results: &Vec<SearchResult>) -> Result<String> {
+    fn generate_svg(&self, satellites: &[Satellite]) -> Result<String> {
         let mut current_y = TOP_PADDING;
         let mut content = String::new();
         let now_utc = Utc::now();
         
-        if search_results.is_empty() {
+        if satellites.is_empty() {
             content.push_str(&format!(
                 r#"<text x="410" y="100" text-anchor="middle" class="table-text">No satellite data available.</text>"#
             ));
             current_y = 120.0;
         } else {
-            for result in search_results {
-                let block = self.generate_satellite_block(&result.transponder, &mut current_y, &now_utc)?;
-                content.push_str(&block);
+            for sat in satellites {
+                content.push_str(&self.generate_satellite_block(sat, &sat.norad_id, &mut current_y, &now_utc)?);
             }
         }
         
@@ -177,6 +175,7 @@ impl SatelliteRenderer {
     fn generate_satellite_block(
         &self,
         transponder: &Transponder,
+        norad_id: &u32,
         current_y: &mut f32,
         now_utc: &DateTime<Utc>,
     ) -> Result<String> {
@@ -187,8 +186,8 @@ impl SatelliteRenderer {
             r#"<text x="{}" y="{}" class="satellite-title">{} (NORAD {})</text>"#,
             X_CALLSIGN,
             *current_y + BLOCK_TITLE_HEIGHT / 2.0,
-            &transponder.amsat_api_name,
-            &transponder.norad_id.map_or("Unknown".to_string(), |id| id.to_string())
+            Self::escape_xml(if transponder.amsat_api_name.is_none() { "Unknown" } else { transponder.amsat_api_name.as_ref().unwrap() }),
+            norad_id
         ));
         block.push('\n');
         *current_y += BLOCK_TITLE_HEIGHT;
@@ -247,7 +246,7 @@ impl SatelliteRenderer {
         // Render reports
         if let Some(ref reports) = transponder.amsat_report {
             block.push_str(&self.generate_reports_section(
-                &transponder.amsat_api_name,
+                transponder.amsat_api_name.as_deref().unwrap_or("Unknown"),
                 reports,
                 current_y,
                 now_utc,
@@ -270,7 +269,7 @@ impl SatelliteRenderer {
             let downlink = trans.downlink.to_display();
             
             info.push_str(&format!(
-                r#"<text x="{}" y="{}" class="table-text" style="font-size:14px;fill:#666;">↑{} ↓{} | {}</text>"#,
+                r#"<text x="{}" y="{}" class="table-text" style="font-size:11px;fill:#666;">↑{} ↓{} | {}</text>"#,
                 X_CALLSIGN,
                 *current_y + TRANSPONDER_INFO_HEIGHT / 2.0,
                 Self::escape_xml(&uplink),
@@ -283,7 +282,7 @@ impl SatelliteRenderer {
         
         if transponders.len() > 1 {
             info.push_str(&format!(
-                r#"<text x="{}" y="{}" class="table-text" style="font-size:12px;fill:#999;">({} transponders total)</text>"#,
+                r#"<text x="{}" y="{}" class="table-text" style="font-size:10px;fill:#999;">({} transponders total)</text>"#,
                 X_CALLSIGN,
                 *current_y + 12.0,
                 transponders.len()

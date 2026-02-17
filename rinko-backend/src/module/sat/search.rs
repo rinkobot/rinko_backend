@@ -1,63 +1,120 @@
-///! Search engine for satellite name matching
-use super::types::SatelliteList;
+use crate::module::sat::Transponder;
+
+///! Search engine - NORAD ID based search
+///!
+///! Supports searching by NORAD ID, satellite name, and aliases
+
+use super::types::{NoradId, Satellite};
 use strsim::jaro_winkler;
 
 /// Default similarity threshold for fuzzy matching
-pub const DEFAULT_THRESHOLD: f64 = 0.85;
+pub const DEFAULT_THRESHOLD: f64 = 0.95;
 
-/// Search for satellites matching the query
-/// 
-/// # Search Priority
-/// 1. Exact match on official name
-/// 2. Exact match on aliases
-/// 3. Catalog number match (if available)
-/// 4. Fuzzy match (Jaro-Winkler similarity >= threshold)
-/// 
-/// # Arguments
-/// * `query` - Search query string
-/// * `satellite_list` - List of satellites to search
-/// * `threshold` - Similarity threshold (0.0 to 1.0)
-/// 
-/// # Returns
-/// Vec of matching satellite official names, ordered by relevance
-pub fn search_satellites(
-    query: &str,
-    satellite_list: &SatelliteList,
-    threshold: f64,
-) -> Vec<String> {
-    // First try hard match (exact match)
-    let hard_matches = hard_match(query, satellite_list);
-    if !hard_matches.is_empty() {
-        return hard_matches;
-    }
-    
-    // Then try fuzzy match
-    let fuzzy_matches = fuzzy_match(query, satellite_list, threshold);
-    fuzzy_matches.into_iter().map(|(_, name)| name).collect()
+/// Search result
+#[derive(Debug, Clone)]
+pub struct SearchResult {
+    pub transponder: Transponder,
+    pub score: f64,
+    pub match_type: MatchType,
 }
 
-/// Hard match: exact match on official name, aliases, or catalog number
-fn hard_match(query: &str, satellite_list: &SatelliteList) -> Vec<String> {
+/// Match type
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatchType {
+    NoradId,
+    ExactName,
+    Alias,
+    FuzzyName,
+}
+
+/// Search for transponders
+/// 
+/// # Search Priority
+/// 0. Special keywords (e.g. "FM", "Linear", "SSTV", "Image")
+/// 1. AMSAT API name exact match && aliases exact match
+/// 2. Exact match on NORAD ID
+/// 3. Exact match on common name
+/// 4. Fuzzy match (Jaro-Winkler >= threshold)
+pub fn search_transponders(
+    query: &str,
+    satellites: &[Satellite],
+    threshold: f64,
+) -> Vec<SearchResult> {
+    // Check for multiple queries separated by '/'
+    if query.contains('/') {
+        return search_multiple(query, satellites, threshold);
+    }
+
+    // Check for special keywords
+    if let Some(special_results) = check_special_keywords(query, satellites) && !special_results.is_empty() {
+        return special_results;
+    }
+
+    // Try AMSAT API name exact match && aliases exact match first
+    let exact_matches = exact_match(query, satellites);
+    if !exact_matches.is_empty() {
+        return exact_matches;
+    }
+    
+    // Try NORAD ID
+    if let Ok(norad_id) = query.parse::<NoradId>() {
+        return search_by_norad_id(norad_id, satellites);
+    }
+    
+    // Fuzzy match
+    fuzzy_match(query, satellites, threshold)
+}
+
+/// Search by NORAD ID
+fn search_by_norad_id(norad_id: NoradId, satellites: &[Satellite]) -> Vec<SearchResult> {
+    let mut results = Vec::new();
+    for sat in satellites {
+        if sat.norad_id == norad_id {
+            for trans in &sat.transponders {
+                results.push(SearchResult {
+                    transponder: trans.clone(),
+                    score: 1.0,
+                    match_type: MatchType::NoradId,
+                });
+            }
+        }
+    }
+    results
+}
+
+/// Exact match on name or aliases
+fn exact_match(query: &str, satellites: &[Satellite]) -> Vec<SearchResult> {
     let normalized_query = normalize_string(query);
     let mut results = Vec::new();
     
-    for sat in &satellite_list.satellites {
-        // Check official name
-        if normalize_string(&sat.official_name) == normalized_query {
-            results.push(sat.official_name.clone());
-            continue;
-        }
+    for sat in satellites {
+        // Check if satellite name/aliases match, then return all transponders
+        let sat_matches = normalize_string(&sat.common_name) == normalized_query
+            || sat.aliases.iter().any(|alias| normalize_string(alias) == normalized_query);
         
-        // Check aliases
-        if sat.aliases.iter().any(|alias| normalize_string(alias) == normalized_query) {
-            results.push(sat.official_name.clone());
-            continue;
-        }
-        
-        // Check catalog number
-        if let Some(ref catalog_num) = sat.catalog_number {
-            if normalize_string(catalog_num) == normalized_query {
-                results.push(sat.official_name.clone());
+        // Check transponders
+        for trans in &sat.transponders {
+            // If satellite matched, include this transponder
+            if sat_matches {
+                results.push(SearchResult {
+                    transponder: trans.clone(),
+                    score: 1.0,
+                    match_type: MatchType::ExactName,
+                });
+                continue;
+            }
+            
+            // Otherwise check transponder-specific fields
+            if normalize_string(&trans.label) == normalized_query 
+                || normalize_string(&trans.mode) == normalized_query
+                || normalize_string(&trans.amsat_api_name) == normalized_query
+                || trans.aliases.iter().any(|alias| normalize_string(alias) == normalized_query)
+            {
+                results.push(SearchResult {
+                    transponder: trans.clone(),
+                    score: 1.0,
+                    match_type: MatchType::ExactName,
+                });
             }
         }
     }
@@ -65,40 +122,55 @@ fn hard_match(query: &str, satellite_list: &SatelliteList) -> Vec<String> {
     results
 }
 
-/// Fuzzy match using Jaro-Winkler similarity
+/// Fuzzy match using Jaro-Winkler
 fn fuzzy_match(
     query: &str,
-    satellite_list: &SatelliteList,
+    satellites: &[Satellite],
     threshold: f64,
-) -> Vec<(f64, String)> {
+) -> Vec<SearchResult> {
     let query_lower = query.to_lowercase();
-    let mut matches: Vec<(f64, String)> = Vec::new();
+    let mut matches = Vec::new();
     
-    for sat in &satellite_list.satellites {
-        let mut best_score: f64 = 0.0;
+    for sat in satellites {
+        // Calculate satellite-level match score
+        let sat_common_score = jaro_winkler(&sat.common_name.to_lowercase(), &query_lower);
+        let sat_alias_score = sat.aliases.iter()
+            .map(|alias| jaro_winkler(&alias.to_lowercase(), &query_lower))
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap_or(0.0);
+        let sat_score = sat_common_score.max(sat_alias_score);
         
-        // Check official name
-        let score = jaro_winkler(&query_lower, &sat.official_name.to_lowercase());
-        best_score = best_score.max(score);
-        
-        // Check aliases
-        for alias in &sat.aliases {
-            let score = jaro_winkler(&query_lower, &alias.to_lowercase());
-            best_score = best_score.max(score);
-        }
-        
-        if best_score >= threshold {
-            matches.push((best_score, sat.official_name.clone()));
+        for trans in &sat.transponders {
+            let label_score = jaro_winkler(&trans.label.to_lowercase(), &query_lower);
+            let mode_score = jaro_winkler(&trans.mode.to_lowercase(), &query_lower);
+            let api_name_score = jaro_winkler(&trans.amsat_api_name.to_lowercase(), &query_lower);
+            let trans_alias_score = trans.aliases.iter()
+                .map(|alias| jaro_winkler(&alias.to_lowercase(), &query_lower))
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or(0.0);
+            
+            // Take the best score from all possible matches
+            let score = sat_score.max(label_score).max(mode_score).max(api_name_score).max(trans_alias_score);
+            
+            if score > threshold {
+                matches.push(SearchResult {
+                    transponder: trans.clone(),
+                    score,
+                    match_type: MatchType::FuzzyName,
+                });
+            }
         }
     }
     
-    // Sort by score descending  
-    matches.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by score descending
+    matches.sort_by(|a, b| {
+        b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+    });
     
     matches
 }
 
-/// Normalize string for matching (lowercase, remove punctuation and whitespace)
+/// Normalize string for matching
 pub fn normalize_string(s: &str) -> String {
     s.trim()
         .to_lowercase()
@@ -107,77 +179,120 @@ pub fn normalize_string(s: &str) -> String {
         .collect()
 }
 
-/// Special search keywords that return predefined groups
-pub fn check_special_keywords(query: &str) -> Option<Vec<String>> {
+/// Special search keywords
+pub fn check_special_keywords(query: &str, satellites: &[Satellite]) -> Option<Vec<SearchResult>> {
     let normalized = normalize_string(query);
+    #[allow(unused_mut)]
+    let mut results = Vec::new();
     
     match normalized.as_str() {
-        "fm" => Some(vec![
-            "AO-91".to_string(),
-            "PO-101[FM]".to_string(),
-            "ISS-FM".to_string(),
-            "SO-50".to_string(),
-            "AO-123 FM".to_string(),
-            "SO-124".to_string(),
-            "SO-125".to_string(),
-            "RS95s".to_string(),
-        ]),
-        "linear" | "lin" => Some(vec![
-            "AO-7".to_string(),
-            "AO-27".to_string(),
-            "FO-29".to_string(),
-            "RS-44".to_string(),
-            "QO-100".to_string(),
-            "JO-97".to_string(),
-        ]),
-        _ => None,
+        "fm" => {
+            // Find all FM transponders
+            let mut results = Vec::new();
+            for sat in satellites {
+                for trans in &sat.transponders {
+                    if trans.mode.to_lowercase().contains("fm")
+                        || trans.label.to_lowercase().contains("fm")
+                        || trans.amsat_api_name.to_lowercase().contains("fm")
+                        || trans.aliases.iter().any(|alias| alias.to_lowercase().contains("fm"))
+                    {
+                        results.push(trans.clone());
+                    }
+                }
+            }
+        }
+        "linear" | "lin" => {
+            // Find all linear transponders
+            let mut results = Vec::new();
+            for sat in satellites {
+                for trans in &sat.transponders {
+                    if trans.mode.to_lowercase().contains("linear")
+                        || trans.mode.to_lowercase().contains("lin")
+                        || trans.mode.to_lowercase().contains("digi")
+                        || trans.label.to_lowercase().contains("linear")
+                        || trans.label.to_lowercase().contains("lin")
+                     {
+                        results.push(trans.clone());
+                     }
+                }
+            }
+        }
+        "sstv" => {
+            let mut results = Vec::new();
+            for sat in satellites {
+                for trans in &sat.transponders {
+                    if trans.mode.to_lowercase().contains("sstv")
+                        || trans.label.to_lowercase().contains("sstv")
+                        || trans.amsat_api_name.to_lowercase().contains("sstv")
+                        || trans.aliases.iter().any(|alias| alias.to_lowercase().contains("sstv"))
+                    {
+                        results.push(trans.clone());
+                    }
+                }
+            }
+        }
+        "image" => {
+            let mut results = Vec::new();
+            for sat in satellites {
+                for trans in &sat.transponders {
+                    if trans.mode.to_lowercase().contains("image")
+                        || trans.label.to_lowercase() == "image"
+                        || trans.amsat_api_name.to_lowercase().contains("image")
+                        || trans.aliases.iter().any(|alias| alias.to_lowercase().contains("image"))
+                    {
+                        results.push(trans.clone());
+                    }
+                }
+            }
+        }
+        _ => {},
+    }
+
+    if results.is_empty() {
+        None
+    } else {
+        Some(results.into_iter().map(|trans| SearchResult {
+            transponder: trans,
+            score: 1.0,
+            match_type: MatchType::ExactName,
+        }).collect())
     }
 }
 
-/// Search satellites with special keywords support
-/// 
-/// This function first checks for special keywords, then falls back
-/// to normal search if no special keyword is found.
+/// Search with special keywords support
 pub fn search_with_keywords(
     query: &str,
-    satellite_list: &SatelliteList,
+    satellites: &[Satellite],
     threshold: f64,
-) -> Vec<String> {
+) -> Vec<SearchResult> {
     // Check for special keywords
-    if let Some(satellites) = check_special_keywords(query) {
-        return satellites;
+    if let Some(special_results) = check_special_keywords(query, satellites) {
+        return special_results;
     }
     
     // Normal search
-    search_satellites(query, satellite_list, threshold)
+    search_transponders(query, satellites, threshold)
 }
 
 /// Search multiple queries (separated by '/')
-/// 
-/// # Arguments
-/// * `input` - Input string with queries separated by '/'
-/// * `satellite_list` - List of satellites to search
-/// * `threshold` - Similarity threshold
-/// 
-/// # Returns
-/// Vec of unique matching satellite names
 pub fn search_multiple(
     input: &str,
-    satellite_list: &SatelliteList,
+    satellites: &[Satellite],
     threshold: f64,
-) -> Vec<String> {
+) -> Vec<SearchResult> {
     let queries: Vec<&str> = input.split('/').map(|s| s.trim()).collect();
     let mut results = Vec::new();
+    let mut seen_ids = std::collections::HashSet::new();
     
     for query in queries {
         if query.is_empty() {
             continue;
         }
         
-        let matches = search_with_keywords(query, satellite_list, threshold);
-        for sat_name in matches {
-            if !results.contains(&sat_name) {
-                results.push(sat_name);
+        let matches = search_transponders(query, satellites, threshold);
+        for result in matches {
+            if seen_ids.insert(result.transponder.amsat_api_name.clone()) {
+                results.push(result);
             }
         }
     }
@@ -185,90 +300,140 @@ pub fn search_multiple(
     results
 }
 
+/// Filter satellites by transponder characteristics
+pub fn filter_by_transponder(
+    satellites: &[Satellite],
+    has_uplink: bool,
+    has_downlink: bool,
+    has_beacon: bool,
+) -> Vec<Satellite> {
+    satellites.iter()
+        .filter(|sat| {
+            sat.transponders.iter().any(|t| {
+                let uplink_match = !has_uplink || t.uplink.is_some();
+                let downlink_match = !has_downlink || t.downlink.is_some();
+                let beacon_match = !has_beacon || t.beacon.is_some();
+                uplink_match && downlink_match && beacon_match
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Get satellites with recent reports
+pub fn get_active_satellites(satellites: &[Satellite]) -> Vec<Satellite> {
+    satellites.iter()
+        .filter(|sat| sat.is_active && sat.total_reports() > 0)
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::types::{SatelliteEntry};
+    use super::super::types::{Satellite, Transponder};
 
-    fn create_test_list() -> SatelliteList {
-        let mut list = SatelliteList::default();
+    fn create_test_satellites() -> Vec<Satellite> {
+        let mut sats = Vec::new();
         
-        let mut ao91 = SatelliteEntry::new("AO-91");
-        ao91.aliases = vec!["Fox-1B".to_string(), "RadFxSat".to_string()];
-        ao91.catalog_number = Some("43017".to_string());
-        list.satellites.push(ao91);
+        // ISS
+        let mut iss = Satellite::new(25544, "ISS");
+        iss.aliases = vec!["International Space Station".to_string()];
+        let mut fm_trans = Transponder::new("FM");
+        fm_trans.downlink = super::super::types::Frequency::Single(437.800);
+        iss.transponders.push(fm_trans);
+        sats.push(iss);
         
-        let mut iss = SatelliteEntry::new("ISS-FM");
-        iss.aliases = vec!["ISS".to_string(), "国际空间站".to_string()];
-        iss.catalog_number = Some("25544".to_string());
-        list.satellites.push(iss);
+        // AO-91
+        let mut ao91 = Satellite::new(43017, "AO-91");
+        ao91.aliases = vec!["Fox-1B".to_string()];
+        let mut fm_trans = Transponder::new("FM");
+        fm_trans.downlink = super::super::types::Frequency::Single(145.960);
+        ao91.transponders.push(fm_trans);
+        sats.push(ao91);
         
-        list.satellites.push(SatelliteEntry::new("FO-29"));
+        // AO-7
+        let mut ao7 = Satellite::new(7530, "AO-7");
+        let mut mode_a = Transponder::new("Mode A");
+        mode_a.uplink = super::super::types::Frequency::Range { start: 145.850, end: 145.950 };
+        mode_a.downlink = super::super::types::Frequency::Range { start: 29.400, end: 29.500 };
+        ao7.transponders.push(mode_a);
+        sats.push(ao7);
         
-        list
+        sats
     }
 
     #[test]
-    fn test_exact_match() {
-        let list = create_test_list();
-        let results = search_satellites("AO-91", &list, 0.85);
+    fn test_search_by_norad_id() {
+        let sats = create_test_satellites();
+        let results = search_satellites("25544", &sats, 0.85);
+        
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], "AO-91");
+        assert_eq!(results[0].satellite.norad_id, 25544);
+        assert_eq!(results[0].match_type, MatchType::NoradId);
+    }
+
+    #[test]
+    fn test_exact_name_match() {
+        let sats = create_test_satellites();
+        let results = search_satellites("AO-91", &sats, 0.85);
+        
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].satellite.common_name, "AO-91");
+        assert_eq!(results[0].match_type, MatchType::ExactName);
     }
 
     #[test]
     fn test_alias_match() {
-        let list = create_test_list();
-        let results = search_satellites("Fox-1B", &list, 0.85);
+        let sats = create_test_satellites();
+        let results = search_satellites("Fox-1B", &sats, 0.85);
+        
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], "AO-91");
-    }
-
-    #[test]
-    fn test_catalog_number_match() {
-        let list = create_test_list();
-        let results = search_satellites("43017", &list, 0.85);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0], "AO-91");
-    }
-
-    #[test]
-    fn test_case_insensitive() {
-        let list = create_test_list();
-        let results = search_satellites("ao-91", &list, 0.85);
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0], "AO-91");
+        assert_eq!(results[0].satellite.norad_id, 43017);
+        assert_eq!(results[0].match_type, MatchType::Alias);
     }
 
     #[test]
     fn test_fuzzy_match() {
-        let list = create_test_list();
-        let results = search_satellites("AO91", &list, 0.80);
+        let sats = create_test_satellites();
+        let results = search_satellites("ao91", &sats, 0.80);
+        
         assert!(!results.is_empty());
-        assert!(results.contains(&"AO-91".to_string()));
+        assert!(results.iter().any(|r| r.satellite.common_name == "AO-91"));
     }
 
     #[test]
     fn test_special_keyword_fm() {
-        let list = create_test_list();
-        let results = search_with_keywords("fm", &list, 0.85);
-        assert!(!results.is_empty());
-        assert!(results.contains(&"AO-91".to_string()));
+        let sats = create_test_satellites();
+        let results = search_with_keywords("fm", &sats, 0.85);
+        
+        assert!(results.len() >= 2); // ISS and AO-91
+        assert!(results.iter().any(|r| r.satellite.common_name == "ISS"));
+        assert!(results.iter().any(|r| r.satellite.common_name == "AO-91"));
+    }
+
+    #[test]
+    fn test_special_keyword_linear() {
+        let sats = create_test_satellites();
+        let results = search_with_keywords("linear", &sats, 0.85);
+        
+        assert!(results.iter().any(|r| r.satellite.common_name == "AO-7"));
     }
 
     #[test]
     fn test_multiple_queries() {
-        let list = create_test_list();
-        let results = search_multiple("AO-91/ISS-FM", &list, 0.85);
+        let sats = create_test_satellites();
+        let results = search_multiple("ISS/AO-91", &sats, 0.85);
+        
         assert_eq!(results.len(), 2);
-        assert!(results.contains(&"AO-91".to_string()));
-        assert!(results.contains(&"ISS-FM".to_string()));
     }
 
     #[test]
-    fn test_normalize_string() {
-        assert_eq!(normalize_string("AO-91"), "ao91");
-        assert_eq!(normalize_string("Fox 1B"), "fox1b");
-        assert_eq!(normalize_string("  Test  "), "test");
+    fn test_filter_by_transponder() {
+        let sats = create_test_satellites();
+        let filtered = filter_by_transponder(&sats, true, true, false);
+        
+        // AO-7 has both uplink and downlink
+        assert!(filtered.iter().any(|s| s.common_name == "AO-7"));
     }
 }

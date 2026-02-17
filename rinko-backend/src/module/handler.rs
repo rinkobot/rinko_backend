@@ -4,7 +4,7 @@ use regex::Regex;
 use anyhow::Result;
 use std::sync::Arc;
 
-use super::sat::{SatelliteManager, SatelliteInfo, SatelliteRenderer};
+use super::sat::{SatelliteManager, SatelliteRenderer};
 
 /// Message handler with satellite manager
 pub struct MessageHandler {
@@ -87,34 +87,35 @@ impl MessageHandler {
         if query.is_empty() {
             return Ok(MessageResponse {
                 success: false,
-                message: "Please provide a satellite name to query. Example: /q AO-91".to_string(),
+                message: "Please provide a satellite name to query. Example: /q ISS".to_string(),
                 message_id: uuid::Uuid::now_v7().to_string(),
                 content_type: ContentType::Text as i32,
             });
         }
         
-        // Search for satellites
-        let satellites = self.satellite_manager.search_satellites(query).await?;
+        // Search for transponders matching the query
+        let search_results = self.satellite_manager.search_transponders(query).await;
         
-        if satellites.is_empty() {
+        if search_results.is_empty() {
             return Ok(MessageResponse {
                 success: false,
-                message: format!("Satellite '{}' not found. Try searching by name or alias.", query),
+                message: format!("^ ^)/"),
                 message_id: uuid::Uuid::now_v7().to_string(),
                 content_type: ContentType::Text as i32,
             });
         }
         
-        // Limit to 5 satellites per query
-        let limited_satellites: Vec<_> = satellites.into_iter().take(5).collect();
-        
-        // Try to render as image
+        // Try to render as image using renderer
         let cache_dir = self.satellite_manager.cache_dir();
-        // image_path is like: cache_dir/../iamge_cache/sat_name.png
         let images_dir = cache_dir.join("image_cache");
+
+        // Make sure image cache directory exists
+        tokio::fs::create_dir_all(&images_dir).await
+            .expect("Failed to create image cache directory");
+
         let renderer = SatelliteRenderer::new(&images_dir);
         
-        match renderer.render_satellites(&limited_satellites).await {
+        match renderer.render_transponders(&search_results).await {
             Ok(image_path) => {
                 // Return image path
                 let path_str = image_path.to_string_lossy().to_string();
@@ -129,15 +130,9 @@ impl MessageHandler {
                 // Fallback to text format if rendering fails
                 tracing::warn!("Image rendering failed, falling back to text: {}", e);
                 
-                let response_text = if limited_satellites.len() == 1 {
-                    format_satellite_info(&limited_satellites[0])
-                } else {
-                    format_multiple_satellites(&limited_satellites)
-                };
-                
                 Ok(MessageResponse {
                     success: true,
-                    message: response_text,
+                    message: "Rinko internal error >_".to_string(),
                     message_id: uuid::Uuid::now_v7().to_string(),
                     content_type: ContentType::Text as i32,
                 })
@@ -159,59 +154,57 @@ fn parse_command(content: &str) -> Option<(String, String)> {
 }
 
 /// Format satellite information for display
-fn format_satellite_info(sat: &SatelliteInfo) -> String {
+fn format_satellite_info_v2(sat: &super::sat::Satellite) -> String {
     let mut output = String::new();
     
-    output.push_str(&format!("🛰️ Satellite: {}\n", sat.name));
-    output.push_str(&format!("Active: {}\n", if sat.is_active { "✓ Yes" } else { "✗ No" }));
-    output.push_str(&format!(
-        "Update Status: {}\n",
-        if sat.amsat_update_status { "✓ OK" } else { "✗ Failed" }
-    ));
-    
-    if let Some(catalog_num) = &sat.catalog_number {
-        output.push_str(&format!("Catalog: {}\n", catalog_num));
-    }
-    
-    if let Some(last_fetch) = sat.last_fetch_success {
-        output.push_str(&format!("Last Updated: {}\n", last_fetch.format("%Y-%m-%d %H:%M UTC")));
-    }
+    output.push_str(&format!("🛰️ Satellite: {} (NORAD {})\n", sat.common_name, sat.norad_id));
     
     if !sat.aliases.is_empty() {
         output.push_str(&format!("Aliases: {}\n", sat.aliases.join(", ")));
     }
     
-    let total_reports = sat.total_reports();
-    output.push_str(&format!("\nTotal Reports: {}\n", total_reports));
-    
-    if !sat.data_blocks.is_empty() {
-        output.push_str("\nRecent Time Blocks:\n");
-        for (i, block) in sat.data_blocks.iter().take(3).enumerate() {
-            output.push_str(&format!(
-                "  {}. {} ({} reports)\n",
-                i + 1,
-                block.time,
-                block.reports.len()
-            ));
-        }
+    // Show transponder info
+    output.push_str(&format!("\nTransponders: {}\n", sat.transponders.len()));
+    for (i, transponder) in sat.transponders.iter().enumerate() {
+        output.push_str(&format!(
+            "  {}. {} - Mode: {}\n",
+            i + 1,
+            transponder.label,
+            transponder.mode
+        ));
+        output.push_str(&format!("     Uplink: {}\n", transponder.uplink.to_display()));
+        output.push_str(&format!("     Downlink: {}\n", transponder.downlink.to_display()));
     }
+    
+    // Show status reports
+    let total_reports: usize = sat.transponders.iter()
+        .filter_map(|t| t.amsat_report.as_ref())
+        .map(|blocks| blocks.iter().map(|b| b.reports.len()).sum::<usize>())
+        .sum();
+    output.push_str(&format!("\nTotal Reports: {}\n", total_reports));
     
     output
 }
 
 /// Format multiple satellites for display
-fn format_multiple_satellites(satellites: &[SatelliteInfo]) -> String {
+fn format_multiple_satellites_v2(satellites: &[super::sat::Satellite]) -> String {
     let mut output = String::new();
     
     output.push_str(&format!("🛰️ Found {} satellites:\n\n", satellites.len()));
     
     for (i, sat) in satellites.iter().enumerate() {
+        let total_reports: usize = sat.transponders.iter()
+            .filter_map(|t| t.amsat_report.as_ref())
+            .map(|blocks| blocks.iter().map(|b| b.reports.len()).sum::<usize>())
+            .sum();
+        
         output.push_str(&format!(
-            "{}. {} - {} (Reports: {})\n",
+            "{}. {} (NORAD {}) - {} transponders, {} reports\n",
             i + 1,
-            sat.name,
-            if sat.is_active { "Active" } else { "Inactive" },
-            sat.total_reports()
+            sat.common_name,
+            sat.norad_id,
+            sat.transponders.len(),
+            total_reports
         ));
     }
     

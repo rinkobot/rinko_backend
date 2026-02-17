@@ -5,6 +5,55 @@ use scraper::{Html, Selector};
 
 const AMSAT_STATUS_URL: &str = "https://www.amsat.org/status/";
 
+/// Satellite scraper - fetches satellite list from AMSAT
+pub struct SatelliteScraper {
+    client: reqwest::Client,
+}
+
+impl SatelliteScraper {
+    /// Create a new scraper instance
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+        }
+    }
+    
+    /// Scrape satellite list from AMSAT website
+    pub async fn scrape_satellite_list(&self) -> Result<SatelliteList> {
+        let names = fetch_satellite_names().await?;
+        
+        let mut list = SatelliteList { satellites: Vec::new() };
+        for name in names {
+            list.satellites.push(SatelliteEntry {
+                official_name: name,
+                aliases: Vec::new(),
+                catalog_number: None,
+            });
+        }
+        
+        Ok(list)
+    }
+}
+
+impl Default for SatelliteScraper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Temporary types for scraper compatibility
+#[derive(Debug, Clone)]
+pub struct SatelliteList {
+    pub satellites: Vec<SatelliteEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SatelliteEntry {
+    pub official_name: String,
+    pub aliases: Vec<String>,
+    pub catalog_number: Option<String>,
+}
+
 /// Fetch list of satellite names from AMSAT status page
 /// 
 /// Scrapes the satellite dropdown menu from the AMSAT status page
