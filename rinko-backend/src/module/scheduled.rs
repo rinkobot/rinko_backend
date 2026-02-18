@@ -219,12 +219,11 @@ impl ScheduledTaskManager {
         match tokio::time::timeout(timeout_duration, manager.update_all_satellites()).await {
             Ok(result) => result.map(|report| {
                 tracing::info!(
-                    "Satellite update: {} total, {} successful, {} failed, {} new, {} inactive",
-                    report.total_satellites,
+                    "Satellite update: {} total, {} successful, {} failed, {} new",
+                    report.total_entries,
                     report.successful_updates,
                     report.failed_updates,
-                    report.new_satellites.len(),
-                    report.inactive_satellites.len()
+                    report.new_entries.len(),
                 );
             }),
             Err(_) => {

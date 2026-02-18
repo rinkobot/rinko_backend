@@ -37,6 +37,11 @@ impl DxWorldScraper {
                 .with_context(|| format!("Failed to create directory: {:?}", self.file_save_dir))?;
             info!("Created save directory: {:?}", self.file_save_dir);
         }
+        if !self.image_cache_dir.exists() {
+            fs::create_dir_all(&self.image_cache_dir).await
+                .with_context(|| format!("Failed to create image cache directory: {:?}", self.image_cache_dir))?;
+            info!("Created image cache directory: {:?}", self.image_cache_dir);
+        }
         Ok(())
     }
 

@@ -98,16 +98,12 @@ impl SatelliteUpdater {
                         "✓ Satellite update completed: {} successful, {} failed, {} new, {:.2}s",
                         report.successful_updates,
                         report.failed_updates,
-                        report.new_satellites.len(),
+                        report.new_entries.len(),
                         report.duration_seconds
                     );
 
-                    if !report.new_satellites.is_empty() {
-                        tracing::info!("New satellites: {:?}", report.new_satellites);
-                    }
-
-                    if !report.inactive_satellites.is_empty() {
-                        tracing::warn!("Inactive satellites: {:?}", report.inactive_satellites);
+                    if !report.new_entries.is_empty() {
+                        tracing::info!("New entries: {:?}", report.new_entries);
                     }
 
                     // Success, break retry loop

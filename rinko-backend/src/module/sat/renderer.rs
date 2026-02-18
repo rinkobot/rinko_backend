@@ -1,10 +1,11 @@
 use crate::module::sat::SearchResult;
+use super::manager::{AmsatSearchResult, SatelliteManager};
 
 ///! Satellite status renderer - Multi-transponder support
 ///!
-///! Generate images from V2 satellite data with transponder information
+///! Generate images from satellite data with transponder information
 
-use super::types::{Satellite, Transponder, ReportStatus, SatelliteDataBlock};
+use super::types::{Transponder, ReportStatus, SatelliteDataBlock};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Timelike, Utc};
 use std::path::{Path, PathBuf};
@@ -78,7 +79,7 @@ impl SatelliteRenderer {
         }
     }
     
-    /// Render transponders to image
+    /// Render transponders to image (legacy API)
     pub async fn render_transponders(&self, search_results: &Vec<SearchResult>) -> Result<PathBuf> {
         tokio::fs::create_dir_all(&self.output_dir)
             .await
@@ -97,6 +98,194 @@ impl SatelliteRenderer {
         tracing::info!("Generated satellite status image: {:?}", output_path);
         
         Ok(output_path)
+    }
+
+    /// Render AMSAT search results to image (new dual-store API)
+    pub async fn render_amsat_results(
+        &self,
+        results: &[AmsatSearchResult],
+        manager: &SatelliteManager,
+    ) -> Result<PathBuf> {
+        tokio::fs::create_dir_all(&self.output_dir)
+            .await
+            .context("Failed to create output directory")?;
+
+        let filename = self.generate_amsat_filename(results);
+        let output_path = self.output_dir.join(&filename);
+
+        if output_path.exists() {
+            tracing::debug!("Using cached image: {:?}", output_path);
+            return Ok(output_path);
+        }
+
+        let svg_content = self.generate_amsat_svg(results, manager)?;
+        self.render_svg_to_png(&svg_content, &output_path).await?;
+
+        tracing::info!("Generated satellite status image: {:?}", output_path);
+        Ok(output_path)
+    }
+
+    /// Generate filename for AMSAT results
+    fn generate_amsat_filename(&self, results: &[AmsatSearchResult]) -> String {
+        let now = chrono::Utc::now();
+        let minute = (now.minute() / 15) * 15;
+        let floored = now
+            .with_minute(minute)
+            .unwrap()
+            .with_second(0)
+            .unwrap()
+            .with_nanosecond(0)
+            .unwrap();
+
+        let time_str = floored.format("%Y%m%d_%H%M").to_string();
+
+        let names: Vec<String> = results
+            .iter()
+            .take(5)
+            .map(|r| Self::normalize_sat_name(&r.entry.api_name))
+            .collect();
+
+        let name_part = if names.is_empty() {
+            "empty".to_string()
+        } else if names.len() > 3 {
+            format!("{}_and_{}_more", names[..2].join("_"), names.len() - 2)
+        } else {
+            names.join("_")
+        };
+
+        format!("sat_{}_{}.png", time_str, name_part)
+    }
+
+    /// Generate SVG for AMSAT results
+    fn generate_amsat_svg(
+        &self,
+        results: &[AmsatSearchResult],
+        manager: &SatelliteManager,
+    ) -> Result<String> {
+        let mut current_y = TOP_PADDING;
+        let mut content = String::new();
+        let now_utc = Utc::now();
+
+        if results.is_empty() {
+            content.push_str(
+                r#"<text x="410" y="100" text-anchor="middle" class="table-text">No satellite data available.</text>"#,
+            );
+            current_y = 120.0;
+        } else {
+            for result in results {
+                let metadata = manager.lookup_metadata(&result.entry);
+                let block = self.generate_amsat_block(&result.entry, metadata.as_ref(), &mut current_y, &now_utc)?;
+                content.push_str(&block);
+            }
+        }
+
+        let footer = self.generate_footer(current_y);
+        let total_height = current_y + FOOTER_HEIGHT;
+
+        let svg = SVG_TEMPLATE
+            .replace("{{SVG_HEIGHT}}", &total_height.to_string())
+            .replace("{{CONTENT}}", &content)
+            .replace("{{FOOTER}}", &footer);
+
+        Ok(svg)
+    }
+
+    /// Generate a block for a single AMSAT entry
+    fn generate_amsat_block(
+        &self,
+        entry: &super::amsat_types::AmsatEntry,
+        metadata: Option<&super::manager::TransponderMetadata>,
+        current_y: &mut f32,
+        now_utc: &DateTime<Utc>,
+    ) -> Result<String> {
+        let mut block = String::new();
+
+        // Title: API name (+ NORAD ID if known from metadata)
+        let title = if let Some(meta) = metadata {
+            format!("{} (NORAD {})", entry.api_name, meta.norad_id)
+        } else {
+            entry.api_name.clone()
+        };
+        block.push_str(&format!(
+            r#"<text x="{}" y="{}" class="satellite-title">{}</text>"#,
+            X_CALLSIGN,
+            *current_y + BLOCK_TITLE_HEIGHT / 2.0,
+            Self::escape_xml(&title)
+        ));
+        block.push('\n');
+        *current_y += BLOCK_TITLE_HEIGHT;
+
+        // Transponder info from metadata (if available)
+        if let Some(meta) = metadata {
+            block.push_str(&format!(
+                r#"<text x="{}" y="{}" class="table-text" style="font-size:14px;fill:#666;">↑{} ↓{} | {}</text>"#,
+                X_CALLSIGN,
+                *current_y + TRANSPONDER_INFO_HEIGHT / 2.0,
+                Self::escape_xml(&meta.uplink),
+                Self::escape_xml(&meta.downlink),
+                Self::escape_xml(&meta.mode)
+            ));
+            block.push('\n');
+            *current_y += TRANSPONDER_INFO_HEIGHT;
+        }
+
+        // AMSAT update status
+        let (status_class, status_text) = if entry.update_success {
+            ("amsat-update-success", "AMSAT Update: Success")
+        } else {
+            ("amsat-update-failure", "AMSAT Update: Failed")
+        };
+
+        let logo_size = ROW_HEIGHT * 0.6;
+        let logo_x = X_TIME;
+        let logo_y = *current_y + (ROW_HEIGHT - logo_size) / 2.0;
+
+        block.push_str(&format!(
+            r#"<image x="{}" y="{}" width="{}" height="{}" href="resources/amsat.png"/><text x="{}" y="{}" class="{}">{}</text>
+"#,
+            logo_x, logo_y, logo_size, logo_size,
+            logo_x + logo_size + 10.0,
+            *current_y + ROW_HEIGHT / 2.0,
+            status_class,
+            status_text
+        ));
+
+        // Last update time
+        let last_update_str = entry.last_updated.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+        let hours_ago = (now_utc.signed_duration_since(entry.last_updated)).num_hours();
+
+        block.push_str(&format!(
+            r#"<text x="{}" y="{}" class="table-text">Last update: {} ({}h ago)</text>"#,
+            X_CALLSIGN,
+            *current_y + ROW_HEIGHT / 2.0,
+            last_update_str,
+            hours_ago
+        ));
+        block.push('\n');
+        *current_y += ROW_HEIGHT;
+
+        // Reports
+        let total_reports = entry.total_reports();
+        if total_reports == 0 {
+            block.push_str(&format!(
+                r#"<text x="410" y="{}" text-anchor="middle" class="table-text">No reports available.</text>"#,
+                *current_y + 40.0
+            ));
+            block.push('\n');
+            *current_y += 80.0;
+            *current_y += BLOCK_SPACING;
+            return Ok(block);
+        }
+
+        block.push_str(&self.generate_reports_section(
+            &entry.api_name,
+            &entry.reports,
+            current_y,
+            now_utc,
+        )?);
+
+        *current_y += BLOCK_SPACING;
+        Ok(block)
     }
     
     /// Generate filename
@@ -261,6 +450,17 @@ impl SatelliteRenderer {
     /// Generate transponder information
     fn generate_transponder_info(&self, transponders: &[Transponder], current_y: &mut f32) -> String {
         let mut info = String::new();
+
+        if transponders.is_empty() {
+            info.push_str(&format!(
+                r#"<text x="{}" y="{}" class="table-text" style="font-size:14px;fill:#666;">No transponder information available.</text>"#,
+                X_CALLSIGN,
+                *current_y + TRANSPONDER_INFO_HEIGHT / 2.0
+            ));
+            info.push('\n');
+            *current_y += TRANSPONDER_INFO_HEIGHT;
+            return info;
+        }
         
         let primary = transponders.iter().find(|t| t.is_primary)
             .or_else(|| transponders.first());

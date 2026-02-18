@@ -112,46 +112,6 @@ pub async fn fetch_satellite_names() -> Result<Vec<String>> {
     Ok(satellite_names)
 }
 
-/// Get a hardcoded list of known AMSAT satellites as fallback
-/// 
-/// This list is based on common amateur radio satellites and serves
-/// as a fallback if the scraper fails.
-pub fn get_known_satellites() -> Vec<String> {
-    vec![
-        "AISAT-1", "AO-123", "AO-16", "AO-27", "AO-73", "AO-7[A]", "AO-7[B]",
-        "AO-85", "AO-91", "CAS-2T", "CAS-4A", "CAS-4B", "CatSat", "CUTE-1",
-        "DSTAR1", "DUCHIFAT1", "DUCHIFAT3", "EO-79", "EO-80", "ESEO",
-        "FloripaSat-1", "FO-118[H/u]", "FO-118[V/u+FM]", "FO-118[V/u]",
-        "FO-29", "FO-99", "GO-32", "HA-1", "HO-107", "HO-113", "IO-117",
-        "IO-26", "IO-86", "ISS-DATA", "ISS-DATV", "ISS-FM", "ISS-SSTV",
-        "JO-97", "K2SAT", "LEDSAT", "LilacSat-2", "LO-19", "LO-87", "LO-90",
-        "LO-93", "MO-122", "NO-44", "NO-45", "OUFTI-1", "PO-101[FM]",
-        "QO-100", "RS-44", "RS95s", "SO-50", "SO-124", "SO-125",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-/// Fetch satellite names with fallback to known list
-/// 
-/// Attempts to scrape the AMSAT website, but falls back to a
-/// hardcoded list of known satellites if scraping fails.
-pub async fn fetch_satellite_names_with_fallback() -> Vec<String> {
-    match fetch_satellite_names().await {
-        Ok(names) if !names.is_empty() => names,
-        Ok(_) => {
-            tracing::warn!("Scraper returned empty list, using fallback");
-            get_known_satellites()
-        }
-        Err(e) => {
-            tracing::error!("Failed to scrape satellite list: {}", e);
-            tracing::info!("Using fallback list of known satellites");
-            get_known_satellites()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

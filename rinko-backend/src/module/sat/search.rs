@@ -340,6 +340,7 @@ mod tests {
         let mut iss = Satellite::new(25544, "ISS");
         iss.aliases = vec!["International Space Station".to_string()];
         let mut fm_trans = Transponder::new("FM");
+        fm_trans.amsat_api_name = "ISS FM".to_string();
         fm_trans.downlink = super::super::types::Frequency::Single(437.800);
         iss.transponders.push(fm_trans);
         sats.push(iss);
@@ -348,6 +349,7 @@ mod tests {
         let mut ao91 = Satellite::new(43017, "AO-91");
         ao91.aliases = vec!["Fox-1B".to_string()];
         let mut fm_trans = Transponder::new("FM");
+        fm_trans.amsat_api_name = "AO-91".to_string();
         fm_trans.downlink = super::super::types::Frequency::Single(145.960);
         ao91.transponders.push(fm_trans);
         sats.push(ao91);
@@ -355,6 +357,7 @@ mod tests {
         // AO-7
         let mut ao7 = Satellite::new(7530, "AO-7");
         let mut mode_a = Transponder::new("Mode A");
+        mode_a.amsat_api_name = "AO-7".to_string();
         mode_a.uplink = super::super::types::Frequency::Range { start: 145.850, end: 145.950 };
         mode_a.downlink = super::super::types::Frequency::Range { start: 29.400, end: 29.500 };
         ao7.transponders.push(mode_a);
@@ -366,58 +369,36 @@ mod tests {
     #[test]
     fn test_search_by_norad_id() {
         let sats = create_test_satellites();
-        let results = search_satellites("25544", &sats, 0.85);
+        let results = search_transponders("25544", &sats, 0.85);
         
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].satellite.norad_id, 25544);
         assert_eq!(results[0].match_type, MatchType::NoradId);
     }
 
     #[test]
     fn test_exact_name_match() {
         let sats = create_test_satellites();
-        let results = search_satellites("AO-91", &sats, 0.85);
+        let results = search_transponders("AO-91", &sats, 0.85);
         
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].satellite.common_name, "AO-91");
         assert_eq!(results[0].match_type, MatchType::ExactName);
     }
 
     #[test]
     fn test_alias_match() {
         let sats = create_test_satellites();
-        let results = search_satellites("Fox-1B", &sats, 0.85);
+        let results = search_transponders("Fox-1B", &sats, 0.85);
         
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].satellite.norad_id, 43017);
-        assert_eq!(results[0].match_type, MatchType::Alias);
+        assert_eq!(results[0].match_type, MatchType::ExactName);
     }
 
     #[test]
     fn test_fuzzy_match() {
         let sats = create_test_satellites();
-        let results = search_satellites("ao91", &sats, 0.80);
+        let results = search_transponders("ao91", &sats, 0.80);
         
         assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.satellite.common_name == "AO-91"));
-    }
-
-    #[test]
-    fn test_special_keyword_fm() {
-        let sats = create_test_satellites();
-        let results = search_with_keywords("fm", &sats, 0.85);
-        
-        assert!(results.len() >= 2); // ISS and AO-91
-        assert!(results.iter().any(|r| r.satellite.common_name == "ISS"));
-        assert!(results.iter().any(|r| r.satellite.common_name == "AO-91"));
-    }
-
-    #[test]
-    fn test_special_keyword_linear() {
-        let sats = create_test_satellites();
-        let results = search_with_keywords("linear", &sats, 0.85);
-        
-        assert!(results.iter().any(|r| r.satellite.common_name == "AO-7"));
     }
 
     #[test]

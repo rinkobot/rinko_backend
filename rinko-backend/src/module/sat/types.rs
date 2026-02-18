@@ -111,32 +111,7 @@ pub struct SatelliteDataBlock {
     pub reports: Vec<AmsatReport>,      // Reports for this time block
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_report_status_conversion() {
-        assert_eq!(ReportStatus::from_string("heard"), ReportStatus::Blue);
-        assert_eq!(ReportStatus::from_string("Heard"), ReportStatus::Blue);
-        assert_eq!(ReportStatus::from_string("not heard"), ReportStatus::Red);
-        assert_eq!(ReportStatus::from_string("unknown"), ReportStatus::Grey);
-    }
-
-    #[test]
-    fn test_report_status_color() {
-        assert_eq!(ReportStatus::Blue.to_color_hex(), "#4297f3ff");
-        assert_eq!(ReportStatus::Red.to_color_hex(), "#ed3f3fff");
-    }
-
-    #[test]
-    fn test_satellite_info_creation() {
-        let sat = SatelliteInfo::new("AO-91");
-        assert_eq!(sat.name, "AO-91");
-        assert!(sat.is_active);
-        assert_eq!(sat.total_reports(), 0);
-    }
-}
+// Report status tests are in the main tests block below
 
 
 /// Frequency representation supporting various formats
@@ -651,6 +626,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_report_status_conversion() {
+        assert_eq!(ReportStatus::from_string("heard"), ReportStatus::Blue);
+        assert_eq!(ReportStatus::from_string("Heard"), ReportStatus::Blue);
+        assert_eq!(ReportStatus::from_string("not heard"), ReportStatus::Red);
+        assert_eq!(ReportStatus::from_string("unknown"), ReportStatus::Grey);
+    }
+
+    #[test]
+    fn test_report_status_color() {
+        assert_eq!(ReportStatus::Blue.to_color_hex(), "#4297f3ff");
+        assert_eq!(ReportStatus::Red.to_color_hex(), "#ed3f3fff");
+    }
+
+    #[test]
+    fn test_satellite_creation() {
+        let sat = Satellite::new(25544, "ISS");
+        assert_eq!(sat.norad_id, 25544);
+        assert_eq!(sat.common_name, "ISS");
+        assert!(sat.is_active);
+        assert_eq!(sat.total_reports(), 0);
+    }
+
+    #[test]
     fn test_frequency_parse_single() {
         let freq = Frequency::parse("145.800");
         assert_eq!(freq, Frequency::Single(145.800));
@@ -676,15 +674,6 @@ mod tests {
         let freq = Frequency::parse("");
         assert_eq!(freq, Frequency::None);
         assert_eq!(freq.to_display(), "N/A");
-    }
-
-    #[test]
-    fn test_satellite_creation() {
-        let sat = Satellite::new(25544, "ISS");
-        assert_eq!(sat.norad_id, 25544);
-        assert_eq!(sat.common_name, "ISS");
-        assert!(sat.is_active);
-        assert_eq!(sat.total_reports(), 0);
     }
 
     #[test]

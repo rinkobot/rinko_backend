@@ -93,8 +93,8 @@ impl MessageHandler {
             });
         }
         
-        // Search for transponders matching the query
-        let search_results = self.satellite_manager.search_transponders(query).await;
+        // Search for AMSAT entries matching the query
+        let search_results = self.satellite_manager.search_amsat_entries(query).await;
         
         if search_results.is_empty() {
             return Ok(MessageResponse {
@@ -115,7 +115,7 @@ impl MessageHandler {
 
         let renderer = SatelliteRenderer::new(&images_dir);
         
-        match renderer.render_transponders(&search_results).await {
+        match renderer.render_amsat_results(&search_results, &self.satellite_manager).await {
             Ok(image_path) => {
                 // Return image path
                 let path_str = image_path.to_string_lossy().to_string();
@@ -151,64 +151,6 @@ fn parse_command(content: &str) -> Option<(String, String)> {
     } else {
         None
     }
-}
-
-/// Format satellite information for display
-fn format_satellite_info_v2(sat: &super::sat::Satellite) -> String {
-    let mut output = String::new();
-    
-    output.push_str(&format!("🛰️ Satellite: {} (NORAD {})\n", sat.common_name, sat.norad_id));
-    
-    if !sat.aliases.is_empty() {
-        output.push_str(&format!("Aliases: {}\n", sat.aliases.join(", ")));
-    }
-    
-    // Show transponder info
-    output.push_str(&format!("\nTransponders: {}\n", sat.transponders.len()));
-    for (i, transponder) in sat.transponders.iter().enumerate() {
-        output.push_str(&format!(
-            "  {}. {} - Mode: {}\n",
-            i + 1,
-            transponder.label,
-            transponder.mode
-        ));
-        output.push_str(&format!("     Uplink: {}\n", transponder.uplink.to_display()));
-        output.push_str(&format!("     Downlink: {}\n", transponder.downlink.to_display()));
-    }
-    
-    // Show status reports
-    let total_reports: usize = sat.transponders.iter()
-        .filter_map(|t| t.amsat_report.as_ref())
-        .map(|blocks| blocks.iter().map(|b| b.reports.len()).sum::<usize>())
-        .sum();
-    output.push_str(&format!("\nTotal Reports: {}\n", total_reports));
-    
-    output
-}
-
-/// Format multiple satellites for display
-fn format_multiple_satellites_v2(satellites: &[super::sat::Satellite]) -> String {
-    let mut output = String::new();
-    
-    output.push_str(&format!("🛰️ Found {} satellites:\n\n", satellites.len()));
-    
-    for (i, sat) in satellites.iter().enumerate() {
-        let total_reports: usize = sat.transponders.iter()
-            .filter_map(|t| t.amsat_report.as_ref())
-            .map(|blocks| blocks.iter().map(|b| b.reports.len()).sum::<usize>())
-            .sum();
-        
-        output.push_str(&format!(
-            "{}. {} (NORAD {}) - {} transponders, {} reports\n",
-            i + 1,
-            sat.common_name,
-            sat.norad_id,
-            sat.transponders.len(),
-            total_reports
-        ));
-    }
-    
-    output
 }
 
 #[cfg(test)]

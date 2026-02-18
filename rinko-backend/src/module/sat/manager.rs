@@ -1,12 +1,17 @@
-///! Satellite Manager - NORAD ID based management
+///! Satellite Manager - Dual-store architecture
 ///!
-///! Core business logic for managing satellites with NORAD ID as primary key
+///! Primary store: AMSAT entries (keyed by API name)
+///! Secondary store: FrequencyDatabase (GitHub CSV metadata, read-only reference)
+///!
+///! The manager fetches status data from AMSAT API and stores it directly
+///! as AmsatEntry objects. Metadata from the CSV database is looked up
+///! lazily at render/query time.
 
 use super::{
     api_client, scraper,
-    types::{NoradId, Satellite, Transponder, Frequency, AmsatReport, SatelliteDataBlock},
+    amsat_types::{AmsatEntry, normalize_for_search, find_matching_transponder_index},
+    types::{AmsatReport, SatelliteDataBlock},
     frequency_db::FrequencyDatabase,
-    name_mapper::NameMapper,
 };
 use anyhow::Result;
 use chrono::{DateTime, Duration, Timelike, Utc};
@@ -14,30 +19,28 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use strsim::jaro_winkler;
 
 const DATA_RETENTION_HOURS: i64 = 48;
-const INACTIVE_THRESHOLD_HOURS: i64 = 168;
 const API_REQUEST_DELAY_MS: u64 = 200;
 
 /// Update report
 #[derive(Debug, Clone)]
 pub struct UpdateReport {
-    pub total_satellites: usize,
+    pub total_entries: usize,
     pub successful_updates: usize,
     pub failed_updates: usize,
-    pub new_satellites: Vec<NoradId>,
-    pub inactive_satellites: Vec<NoradId>,
+    pub new_entries: Vec<String>,
     pub duration_seconds: f64,
 }
 
 impl UpdateReport {
     pub fn new() -> Self {
         Self {
-            total_satellites: 0,
+            total_entries: 0,
             successful_updates: 0,
             failed_updates: 0,
-            new_satellites: Vec::new(),
-            inactive_satellites: Vec::new(),
+            new_entries: Vec::new(),
             duration_seconds: 0.0,
         }
     }
@@ -49,27 +52,25 @@ impl Default for UpdateReport {
     }
 }
 
-/// Satellite Manager
+/// Satellite Manager - dual store architecture
 pub struct SatelliteManager {
-    /// Satellites indexed by NORAD ID
-    satellites: Arc<RwLock<HashMap<NoradId, Satellite>>>,
-    
-    /// Frequency database (CSV)
-    frequency_db: Arc<RwLock<FrequencyDatabase>>,
-    
-    /// Name mapper (AMSAT API <-> CSV)
-    name_mapper: Arc<RwLock<NameMapper>>,
-    
+    /// AMSAT entries indexed by API name (primary data store)
+    amsat_entries: Arc<RwLock<HashMap<String, AmsatEntry>>>,
+
+    /// Frequency database from GitHub CSV (metadata reference, read-only after init)
+    frequency_db: Arc<FrequencyDatabase>,
+
     /// Cache directory
     cache_dir: PathBuf,
-    
-    /// Update interval (minutes)
+
+    /// Update interval (minutes) - stored for reference
     update_interval_minutes: i64,
 }
 
 impl SatelliteManager {
-    /// Create a new manager with default CSV path
-    /// CSV will be downloaded if not present
+    /// Create a new manager
+    ///
+    /// Downloads CSV from GitHub if not present, loads frequency database.
     pub async fn new(
         cache_dir: impl AsRef<Path>,
         update_interval_minutes: i64,
@@ -77,19 +78,19 @@ impl SatelliteManager {
         let cache_dir_path = cache_dir.as_ref();
         let sat_cache_dir = cache_dir_path.join("satellite_cache");
         let csv_path = sat_cache_dir.join("amsat-active-frequencies.csv");
-        
+
         // Ensure satellite cache directory exists
         tokio::fs::create_dir_all(&sat_cache_dir).await?;
-        
+
         // Download CSV if it doesn't exist
         if !csv_path.exists() {
             tracing::info!("Downloading CSV database...");
             super::frequency_db::download_csv_from_github(&csv_path).await?;
         }
-        
+
         Self::new_with_csv(cache_dir, csv_path, update_interval_minutes).await
     }
-    
+
     /// Create a new manager with custom CSV path
     pub async fn new_with_csv(
         cache_dir: impl AsRef<Path>,
@@ -97,322 +98,157 @@ impl SatelliteManager {
         update_interval_minutes: i64,
     ) -> Result<Arc<Self>> {
         let cache_dir = cache_dir.as_ref().to_path_buf();
-        
-        // Load frequency database
+
+        // Load frequency database (read-only metadata reference)
         let frequency_db = FrequencyDatabase::load_from_csv(csv_path).await?;
-        
-        // Create name mapper
-        let name_mapper = NameMapper::with_defaults();
-        
+        let db_stats = frequency_db.stats();
+        tracing::info!("Loaded frequency database: {}", db_stats);
+
         Ok(Arc::new(Self {
-            satellites: Arc::new(RwLock::new(HashMap::new())),
-            frequency_db: Arc::new(RwLock::new(frequency_db)),
-            name_mapper: Arc::new(RwLock::new(name_mapper)),
+            amsat_entries: Arc::new(RwLock::new(HashMap::new())),
+            frequency_db: Arc::new(frequency_db),
             cache_dir,
             update_interval_minutes,
         }))
     }
-    
-    /// Initialize manager - load cache and build mappings
+
+    /// Initialize manager - load AMSAT cache, save metadata snapshot
     pub async fn initialize(&self) -> Result<()> {
         tracing::info!("Initializing satellite manager...");
-        
-        // Load cache from satellite_cache subdirectory
+
         let sat_cache_dir = self.cache_dir.join("satellite_cache");
-        let cache_path = sat_cache_dir.join("satellites.json");
-        
-        let loaded_from_cache = if cache_path.exists() {
-            tracing::info!("Loading cache from: {}", cache_path.display());
-            let content = tokio::fs::read_to_string(&cache_path).await?;
-            let cached: HashMap<NoradId, Satellite> = serde_json::from_str(&content)?;
-            
-            *self.satellites.write().await = cached;
-            tracing::info!("Loaded {} satellites from cache", self.satellites.read().await.len());
-            true
+        let amsat_cache_path = sat_cache_dir.join("amsat_cache.json");
+
+        // Load AMSAT entries from cache
+        if amsat_cache_path.exists() {
+            tracing::info!("Loading AMSAT cache from: {}", amsat_cache_path.display());
+            let content = tokio::fs::read_to_string(&amsat_cache_path).await?;
+            match serde_json::from_str::<HashMap<String, AmsatEntry>>(&content) {
+                Ok(cached) => {
+                    tracing::info!("Loaded {} AMSAT entries from cache", cached.len());
+                    *self.amsat_entries.write().await = cached;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to parse AMSAT cache, starting fresh: {}", e);
+                }
+            }
         } else {
-            // Initialize from frequency database
-            tracing::info!("No cache found, initializing from frequency database");
-            let db = self.frequency_db.read().await;
-            let satellites = db.get_all_satellites()
-                .iter()
-                .map(|sat| (sat.norad_id, (*sat).clone()))
-                .collect();
-            
-            *self.satellites.write().await = satellites;
-            tracing::info!("Initialized {} satellites from CSV", self.satellites.read().await.len());
-            false
-        };
-        
-        // Fetch AMSAT satellite list and build mappings
-        self.update_name_mappings().await?;
-        
-        // Save cache if we loaded from CSV (first time initialization)
-        if !loaded_from_cache {
-            tracing::info!("Saving initial cache...");
-            self.save_cache().await?;
+            tracing::info!("No AMSAT cache found, will populate on first update");
         }
-        
+
+        // Save metadata snapshot for human inspection
+        self.save_metadata_snapshot().await?;
+
         Ok(())
     }
-    
-    /// Update name mappings from AMSAT API
-    async fn update_name_mappings(&self) -> Result<()> {
-        tracing::info!("Updating AMSAT name mappings...");
-        
-        let scraper = scraper::SatelliteScraper::new();
-        let amsat_list = scraper.scrape_satellite_list().await?;
-        
-        let amsat_names: Vec<String> = amsat_list.satellites.iter()
-            .map(|s| s.official_name.clone())
-            .collect();
-        
-        let mut mapper = self.name_mapper.write().await;
-        mapper.set_amsat_names(amsat_names.clone());
-        
-        tracing::info!("Updated name mapper with {} AMSAT satellites", amsat_names.len());
-        
-        Ok(())
-    }
-    
-    /// Update all satellites
+    /// Update all satellites - fetch from AMSAT API and store as AmsatEntry
     pub async fn update_all_satellites(&self) -> Result<UpdateReport> {
         let start_time = std::time::Instant::now();
         let mut report = UpdateReport::new();
-        
+
         tracing::info!("Starting satellite data update...");
-        
-        // Get all AMSAT API satellite names
-        let amsat_names = {
-            let mapper = self.name_mapper.read().await;
-            mapper.stats().amsat_names_count
-        };
-        
-        if amsat_names == 0 {
-            tracing::warn!("No AMSAT names available, updating mappings first");
-            self.update_name_mappings().await?;
-        }
-        
-        // Get AMSAT API names ONLY from the AMSAT website scraper
-        // These are the satellites that actually have status reports available
-        let amsat_api_names: Vec<String> = {
-            let mapper = self.name_mapper.read().await;
-            mapper.get_amsat_names().to_vec()
-        };
-        
-        tracing::info!("Fetching data for {} AMSAT API names", amsat_api_names.len());
-        
-        // Fetch data from AMSAT API
+
+        // Step 1: Scrape AMSAT website for current satellite list
+        let sat_scraper = scraper::SatelliteScraper::new();
+        let amsat_list = sat_scraper.scrape_satellite_list().await?;
+        let amsat_api_names: Vec<String> = amsat_list
+            .satellites
+            .iter()
+            .map(|s| s.official_name.clone())
+            .collect();
+
+        tracing::info!("Found {} AMSAT API names from scraper", amsat_api_names.len());
+
+        // Step 2: Fetch status reports from AMSAT API
         let fetch_results = api_client::batch_fetch_satellites(
             &amsat_api_names,
             1, // Last 1 hour
             API_REQUEST_DELAY_MS,
-        ).await;
-        
-        // First pass: Map all AMSAT names to NORAD IDs (without holding write lock)
-        tracing::debug!("Mapping AMSAT names to NORAD IDs...");
-        let mut norad_mappings: HashMap<String, NoradId> = HashMap::new();
+        )
+        .await;
+
+        // Step 3: Merge into AMSAT entries
         {
-            let mapper = self.name_mapper.read().await;
-            for amsat_name in fetch_results.keys() {
-                if let Some(norad_id) = self.find_norad_id_for_amsat_name(amsat_name, &mapper).await {
-                    norad_mappings.insert(amsat_name.clone(), norad_id);
-                } else {
-                    tracing::debug!("Could not map '{}' to NORAD ID", amsat_name);
-                }
-            }
-        }
-        tracing::debug!("Mapped {} AMSAT names to NORAD IDs", norad_mappings.len());
-        
-        // Second pass: Update satellites with write lock
-        {
-            let mut satellites = self.satellites.write().await;
-            report.total_satellites = satellites.len();
-            
-            for (amsat_name, fetch_result) in fetch_results {
-                if let Some(&norad_id) = norad_mappings.get(&amsat_name) {
-                    match self.update_single_satellite(
-                        norad_id,
-                        &amsat_name,
-                        satellites.get(&norad_id).cloned(),
-                        Some(&fetch_result),
-                    ).await {
-                        Ok(updated_sat) => {
-                            // Check if satellite became inactive
-                            let was_active = satellites.get(&norad_id).map_or(true, |s| s.is_active);
-                            if !updated_sat.is_active && was_active {
-                                report.inactive_satellites.push(norad_id);
-                            }
-                            
-                            satellites.insert(norad_id, updated_sat);
-                            report.successful_updates += 1;
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to update NORAD {}: {}", norad_id, e);
-                            report.failed_updates += 1;
-                        }
+            let mut entries = self.amsat_entries.write().await;
+            report.total_entries = entries.len();
+
+            for (api_name, fetch_result) in fetch_results {
+                // Get or create entry
+                let entry = entries
+                    .entry(api_name.clone())
+                    .or_insert_with(|| {
+                        report.new_entries.push(api_name.clone());
+                        AmsatEntry::from_api_name(&api_name)
+                    });
+
+                match fetch_result {
+                    Ok(reports) if !reports.is_empty() => {
+                        Self::merge_reports(&mut entry.reports, &reports)?;
+                        entry.last_fetch_success = Some(Utc::now());
+                        entry.update_success = true;
+                        report.successful_updates += 1;
+                    }
+                    Ok(_) => {
+                        // Empty response - not an error, just no data
+                        entry.update_success = true;
+                        report.successful_updates += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!("Fetch failed for '{}': {}", api_name, e);
+                        entry.update_success = false;
+                        report.failed_updates += 1;
                     }
                 }
+
+                entry.last_updated = Utc::now();
             }
-        } // Write lock dropped here
-        
-        // Save cache (needs read lock, so must be after write lock is dropped)
-        self.save_cache().await?;
-        
+
+            // Also ensure entries exist for all scraped names (even if fetch wasn't attempted)
+            for name in &amsat_api_names {
+                entries.entry(name.clone()).or_insert_with(|| {
+                    report.new_entries.push(name.clone());
+                    AmsatEntry::from_api_name(name)
+                });
+            }
+        } // Write lock dropped
+
+        // Step 4: Save caches
+        self.save_amsat_cache().await?;
+
+        report.total_entries = self.amsat_entries.read().await.len();
         report.duration_seconds = start_time.elapsed().as_secs_f64();
-        
+
         tracing::info!(
-            "Update complete: {} successful, {} failed in {:.2}s",
+            "Update complete: {} entries, {} successful, {} failed, {} new in {:.2}s",
+            report.total_entries,
             report.successful_updates,
             report.failed_updates,
+            report.new_entries.len(),
             report.duration_seconds
         );
-        
+
         Ok(report)
     }
-    
-    /// Find NORAD ID for AMSAT API name
-    async fn find_norad_id_for_amsat_name(
-        &self,
-        amsat_name: &str,
-        _mapper: &NameMapper,
-    ) -> Option<NoradId> {
-        // Try existing satellites first
-        let satellites = self.satellites.read().await;
-        for sat in satellites.values() {
-            if sat.common_name == amsat_name || sat.aliases.contains(&amsat_name.to_string()) {
-                return Some(sat.norad_id);
-            }
-            
-            // Check transponder AMSAT API names
-            for trans in &sat.transponders {
-                if trans.amsat_api_name == amsat_name {
-                    return Some(sat.norad_id);
-                }
-            }
-        }
-        drop(satellites);
-        
-        // Try frequency database
-        let db = self.frequency_db.read().await;
-        let csv_sats = db.find_satellites_by_name(amsat_name);
-        if let Some(sat) = csv_sats.first() {
-            return Some(sat.norad_id);
-        }
-        
-        None
-    }
-    
-    /// Update a single satellite
-    async fn update_single_satellite(
-        &self,
-        norad_id: NoradId,
-        amsat_api_name: &str,
-        existing: Option<Satellite>,
-        fetch_result: Option<&Result<Vec<AmsatReport>>>,
-    ) -> Result<Satellite> {
-        let mut sat = existing.unwrap_or_else(|| {
-            // Try to get from frequency database - use try_read since we're in async
-            // For now, just create a new satellite if not exists
-            Satellite::new(norad_id, amsat_api_name)
-        });
-        
-        // Process fetch result
-        match fetch_result {
-            Some(Ok(reports)) if !reports.is_empty() => {
-                // Find transponder with this AMSAT API name, or create one
-                let tp_index = sat.transponders.iter()
-                    .position(|t| t.amsat_api_name == amsat_api_name);
-                
-                let transponder = if let Some(idx) = tp_index {
-                    &mut sat.transponders[idx]
-                } else {
-                    // Create a new primary transponder
-                    let mut new_tp = Transponder::new_basic(
-                        amsat_api_name.to_string(),
-                        Frequency::None,
-                        Frequency::None,
-                        norad_id,
-                    );
-                    // Set label to a clean version if not already set
-                    if new_tp.label.is_empty() || new_tp.label == amsat_api_name {
-                        new_tp.label = amsat_api_name.to_string();
-                    }
-                    sat.transponders.push(new_tp);
-                    sat.transponders.last_mut().unwrap()
-                };
-                
-                // Update transponder fields
-                transponder.amsat_api_name = amsat_api_name.to_string();
-                // If label is empty or just the API name, keep the API name as displayable label
-                if transponder.label.is_empty() {
-                    transponder.label = amsat_api_name.to_string();
-                }
-                transponder.last_updated = Utc::now();
-                transponder.last_fetch_success_time = Some(Utc::now());
-                transponder.amsat_update_success = true;
-                
-                self.merge_reports(transponder, reports).await?;
-                
-                sat.last_fetch_success = Some(Utc::now());
-                sat.amsat_update_status = true;
-            }
-            Some(Err(e)) => {
-                tracing::warn!("Fetch failed for {} (NORAD {}): {}", amsat_api_name, norad_id, e);
-                sat.amsat_update_status = false;
-                
-                // Update transponder status if exists
-                if let Some(tp) = sat.transponders.iter_mut().find(|t| t.amsat_api_name == amsat_api_name) {
-                    tp.amsat_update_success = false;
-                }
-            }
-            _ => {
-                sat.amsat_update_status = false;
-                
-                // Update transponder status if exists
-                if let Some(tp) = sat.transponders.iter_mut().find(|t| t.amsat_api_name == amsat_api_name) {
-                    tp.amsat_update_success = false;
-                }
-            }
-        }
-        
-        // Update activity status
-        if let Some(last_success) = sat.last_fetch_success {
-            let hours_since = (Utc::now() - last_success).num_hours();
-            sat.is_active = hours_since <= INACTIVE_THRESHOLD_HOURS;
-        }
-        
-        sat.last_updated = Utc::now();
-        
-        Ok(sat)
-    }
-    
-    /// Merge reports into transponder
-    async fn merge_reports(
-        &self,
-        transponder: &mut Transponder,
+
+    /// Merge new reports into existing data blocks (static helper)
+    fn merge_reports(
+        data_blocks: &mut Vec<SatelliteDataBlock>,
         new_reports: &[AmsatReport],
     ) -> Result<()> {
-        // Get or create report list for this AMSAT API name
-        let data_blocks = match transponder.amsat_report {
-            Some(ref mut blocks) => blocks,
-            None => {
-                transponder.amsat_report = Some(Vec::new());
-                transponder.amsat_report.as_mut().unwrap()
-            }
-        };
-        
         // Group reports by time block (hourly)
         let mut blocks_map: HashMap<String, Vec<AmsatReport>> = HashMap::new();
-        
+
         for report in new_reports {
-            let time_block = self.get_time_block(&report.reported_time)?;
-            blocks_map.entry(time_block).or_insert_with(Vec::new).push(report.clone());
+            let time_block = Self::get_time_block(&report.reported_time)?;
+            blocks_map
+                .entry(time_block)
+                .or_default()
+                .push(report.clone());
         }
-        
+
         // Merge with existing blocks
         for (time, reports) in blocks_map {
             if let Some(existing_block) = data_blocks.iter_mut().find(|b| b.time == time) {
-                // Merge reports (avoid duplicates)
                 for report in reports {
                     if !existing_block.reports.iter().any(|r| {
                         r.callsign == report.callsign && r.reported_time == report.reported_time
@@ -421,35 +257,40 @@ impl SatelliteManager {
                     }
                 }
             } else {
-                // Create new block
                 data_blocks.push(SatelliteDataBlock {
                     time: time.clone(),
                     reports,
                 });
             }
         }
-        
-        // Sort blocks by time
+
+        // Sort blocks by time (newest first)
         data_blocks.sort_by(|a, b| b.time.cmp(&a.time));
-        
+
         // Clean old data
-        self.clean_old_reports(data_blocks);
-        
+        Self::clean_old_reports(data_blocks);
+
         Ok(())
     }
-    
+
     /// Get time block (hourly) from timestamp
-    fn get_time_block(&self, timestamp: &str) -> Result<String> {
+    fn get_time_block(timestamp: &str) -> Result<String> {
         let dt = DateTime::parse_from_rfc3339(timestamp)?;
         let dt_utc = dt.with_timezone(&Utc);
-        let time_block = dt_utc.with_minute(0).unwrap().with_second(0).unwrap().with_nanosecond(0).unwrap();
+        let time_block = dt_utc
+            .with_minute(0)
+            .unwrap()
+            .with_second(0)
+            .unwrap()
+            .with_nanosecond(0)
+            .unwrap();
         Ok(time_block.to_rfc3339())
     }
-    
+
     /// Clean old reports (keep last 48 hours)
-    fn clean_old_reports(&self, data_blocks: &mut Vec<SatelliteDataBlock>) {
+    fn clean_old_reports(data_blocks: &mut Vec<SatelliteDataBlock>) {
         let cutoff = Utc::now() - Duration::hours(DATA_RETENTION_HOURS);
-        
+
         data_blocks.retain(|block| {
             if let Ok(block_time) = DateTime::parse_from_rfc3339(&block.time) {
                 block_time.with_timezone(&Utc) >= cutoff
@@ -458,90 +299,456 @@ impl SatelliteManager {
             }
         });
     }
-    
-    /// Save cache
-    async fn save_cache(&self) -> Result<()> {
+
+    // ─── Cache persistence ───────────────────────────────────────
+
+    /// Save AMSAT cache to disk
+    async fn save_amsat_cache(&self) -> Result<()> {
         let sat_cache_dir = self.cache_dir.join("satellite_cache");
         tokio::fs::create_dir_all(&sat_cache_dir).await?;
-        
-        let cache_path = sat_cache_dir.join("satellites.json");
-        let satellites = self.satellites.read().await;
-        
-        let json = serde_json::to_string_pretty(&*satellites)?;
+
+        let cache_path = sat_cache_dir.join("amsat_cache.json");
+        let entries = self.amsat_entries.read().await;
+
+        let json = serde_json::to_string_pretty(&*entries)?;
         tokio::fs::write(&cache_path, json).await?;
-        
-        tracing::debug!("Saved {} satellites to cache", satellites.len());
-        
+
+        tracing::debug!("Saved {} AMSAT entries to cache", entries.len());
         Ok(())
     }
-    
-    /// Get satellite by NORAD ID
-    pub async fn get_satellite(&self, norad_id: NoradId) -> Option<Satellite> {
-        self.satellites.read().await.get(&norad_id).cloned()
+
+    /// Save metadata snapshot (frequency database info) for human inspection
+    async fn save_metadata_snapshot(&self) -> Result<()> {
+        let sat_cache_dir = self.cache_dir.join("satellite_cache");
+        tokio::fs::create_dir_all(&sat_cache_dir).await?;
+
+        let snapshot_path = sat_cache_dir.join("metadata_snapshot.json");
+
+        // Build a readable summary
+        let all_sats = self.frequency_db.get_all_satellites();
+        let summary: Vec<serde_json::Value> = all_sats
+            .iter()
+            .map(|sat| {
+                serde_json::json!({
+                    "norad_id": sat.norad_id,
+                    "common_name": sat.common_name,
+                    "aliases": sat.aliases,
+                    "transponder_count": sat.transponders.len(),
+                    "transponders": sat.transponders.iter().map(|t| {
+                        serde_json::json!({
+                            "label": t.label,
+                            "amsat_api_name": t.amsat_api_name,
+                            "mode": t.mode,
+                                    "uplink": t.uplink.to_display(),
+                            "downlink": t.downlink.to_display(),
+                        })
+                    }).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+
+        let json = serde_json::to_string_pretty(&summary)?;
+        tokio::fs::write(&snapshot_path, json).await?;
+
+        tracing::debug!(
+            "Saved metadata snapshot with {} satellites",
+            all_sats.len()
+        );
+        Ok(())
     }
-    
-    /// Get all satellites
-    pub async fn get_all_satellites(&self) -> Vec<Satellite> {
-        self.satellites.read().await.values().cloned().collect()
+
+    // ─── Search ──────────────────────────────────────────────────
+
+    /// Search AMSAT entries by query string
+    ///
+    /// Returns matching entries sorted by relevance.
+    /// Search matches against: api_name, aliases, satellite_base_name.
+    pub async fn search_amsat_entries(&self, query: &str) -> Vec<AmsatSearchResult> {
+        let entries = self.amsat_entries.read().await;
+        let entries_vec: Vec<&AmsatEntry> = entries.values().collect();
+        search_amsat_entries(query, &entries_vec)
     }
-    
-    /// Get satellites by IDs
-    pub async fn get_satellites_by_ids(&self, norad_ids: &[NoradId]) -> Vec<Satellite> {
-        let satellites = self.satellites.read().await;
-        norad_ids.iter()
-            .filter_map(|id| satellites.get(id).cloned())
-            .collect()
+
+    /// Get all AMSAT entries
+    pub async fn get_all_amsat_entries(&self) -> Vec<AmsatEntry> {
+        self.amsat_entries.read().await.values().cloned().collect()
     }
-    
-    /// Search transponders by query (NORAD ID, name, alias)
-    pub async fn search_transponders(&self, query: &str) -> Vec<super::search::SearchResult> {
-        let satellites = self.get_all_satellites().await;
-        super::search::search_transponders(query, &satellites, super::search::DEFAULT_THRESHOLD)
+
+    /// Get a single AMSAT entry by API name
+    pub async fn get_amsat_entry(&self, api_name: &str) -> Option<AmsatEntry> {
+        self.amsat_entries.read().await.get(api_name).cloned()
     }
-    
-    /// Get active satellites (have data in last 7 days)
-    pub async fn get_active_satellites(&self) -> Vec<Satellite> {
-        let satellites = self.get_all_satellites().await;
-        super::search::get_active_satellites(&satellites)
-    }
-    
-    /// Get cache directory
-    pub fn cache_dir(&self) -> &std::path::Path {
-        &self.cache_dir
-    }
-    
-    /// Get satellite by NORAD ID
-    pub async fn get_satellite_by_norad(&self, norad_id: NoradId) -> Option<Satellite> {
-        let satellites = self.satellites.read().await;
-        satellites.get(&norad_id).cloned()
-    }
-    
-    /// Get satellite by name or alias (for compatibility)
-    pub async fn get_satellite_by_name(&self, name: &str) -> Option<Satellite> {
-        let satellites = self.satellites.read().await;
-        
-        for sat in satellites.values() {
-            if sat.common_name.eq_ignore_ascii_case(name) {
-                return Some(sat.clone());
+
+    /// Lookup metadata from frequency database for a given AMSAT entry
+    ///
+    /// Tries to find the best-matching Transponder from the CSV database.
+    /// Uses `find_matching_transponder_index` for intelligent matching.
+    pub fn lookup_metadata(&self, entry: &AmsatEntry) -> Option<TransponderMetadata> {
+        // Search frequency database by base name
+        let csv_sats = self.frequency_db.find_satellites_by_name(&entry.satellite_base_name);
+
+        for csv_sat in csv_sats {
+            // Build (label, mode) pairs for matching
+            let labels: Vec<(String, String)> = csv_sat
+                .transponders
+                .iter()
+                .map(|t| (t.label.clone(), t.mode.clone()))
+                .collect();
+
+            if let Some(idx) = find_matching_transponder_index(
+                entry.mode_hint.as_deref(),
+                &labels,
+            ) {
+                let tp = &csv_sat.transponders[idx];
+                return Some(TransponderMetadata {
+                    norad_id: csv_sat.norad_id,
+                    satellite_name: csv_sat.common_name.clone(),
+                    transponder_label: tp.label.clone(),
+                    mode: tp.mode.clone(),
+                    uplink: tp.uplink.to_display(),
+                    downlink: tp.downlink.to_display(),
+                });
             }
-            if sat.aliases.iter().any(|a| a.eq_ignore_ascii_case(name)) {
-                return Some(sat.clone());
+
+            // Fallback: if satellite has only one transponder and no mode hint
+            if csv_sat.transponders.len() == 1 && entry.mode_hint.is_none() {
+                let tp = &csv_sat.transponders[0];
+                return Some(TransponderMetadata {
+                    norad_id: csv_sat.norad_id,
+                    satellite_name: csv_sat.common_name.clone(),
+                    transponder_label: tp.label.clone(),
+                    mode: tp.mode.clone(),
+                    uplink: tp.uplink.to_display(),
+                    downlink: tp.downlink.to_display(),
+                });
             }
         }
-        
+
         None
     }
-    
-    /// Get multiple satellites by names
-    pub async fn get_satellites_by_names(&self, names: &[String]) -> Vec<Satellite> {
-        let mut results = Vec::new();
-        
-        for name in names {
-            if let Some(sat) = self.get_satellite_by_name(name).await {
-                results.push(sat);
-            }
+
+    /// Get cache directory
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// Get frequency database reference (for renderer etc.)
+    pub fn frequency_db(&self) -> &FrequencyDatabase {
+        &self.frequency_db
+    }
+}
+
+// ─── Search types and functions ─────────────────────────────────────
+
+/// Metadata from frequency database (CSV) for a transponder
+#[derive(Debug, Clone)]
+pub struct TransponderMetadata {
+    pub norad_id: u32,
+    pub satellite_name: String,
+    pub transponder_label: String,
+    pub mode: String,
+    pub uplink: String,
+    pub downlink: String,
+}
+
+/// Search result wrapping an AMSAT entry with match info
+#[derive(Debug, Clone)]
+pub struct AmsatSearchResult {
+    pub entry: AmsatEntry,
+    pub match_type: AmsatMatchType,
+    pub score: f64,
+}
+
+/// How the search matched
+#[derive(Debug, Clone, PartialEq)]
+pub enum AmsatMatchType {
+    /// Exact match on API name
+    ExactApiName,
+    /// Match on base satellite name (e.g., "ISS" matches ISS-FM, ISS-SSTV)
+    BaseName,
+    /// Substring/contains match
+    Contains,
+    /// Fuzzy match (Jaro-Winkler)
+    Fuzzy,
+}
+
+/// Search AMSAT entries by query
+fn search_amsat_entries(query: &str, entries: &[&AmsatEntry]) -> Vec<AmsatSearchResult> {
+    let query_normalized = normalize_for_search(query);
+
+    if query_normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let mut results: Vec<AmsatSearchResult> = Vec::new();
+
+    // Phase 1: Exact match on API name
+    for entry in entries {
+        if let Some(result) = exact_match_amsat(entry, &query_normalized) {
+            results.push(result);
         }
-        
-        results
+    }
+    if !results.is_empty() {
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        return results;
+    }
+
+    // Phase 2: Base name match (e.g., "iss" → ISS-FM, ISS-SSTV, ISS-DATA)
+    for entry in entries {
+        if let Some(result) = base_name_match(entry, &query_normalized) {
+            results.push(result);
+        }
+    }
+    if !results.is_empty() {
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        return results;
+    }
+
+    // Phase 3: Contains match
+    for entry in entries {
+        if let Some(result) = contains_match(entry, &query_normalized) {
+            results.push(result);
+        }
+    }
+    if !results.is_empty() {
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        return results;
+    }
+
+    // Phase 4: Fuzzy match (Jaro-Winkler)
+    let fuzzy_threshold = 0.80;
+    for entry in entries {
+        if let Some(result) = fuzzy_match_amsat(entry, &query_normalized, fuzzy_threshold) {
+            results.push(result);
+        }
+    }
+
+    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    results
+}
+
+/// Check exact match on API name or aliases
+fn exact_match_amsat(entry: &AmsatEntry, query_normalized: &str) -> Option<AmsatSearchResult> {
+    let api_normalized = normalize_for_search(&entry.api_name);
+
+    if api_normalized == query_normalized {
+        return Some(AmsatSearchResult {
+            entry: (*entry).clone(),
+            match_type: AmsatMatchType::ExactApiName,
+            score: 1.0,
+        });
+    }
+
+    // Check aliases
+    for alias in &entry.aliases {
+        let alias_normalized = normalize_for_search(alias);
+        if alias_normalized == query_normalized {
+            return Some(AmsatSearchResult {
+                entry: (*entry).clone(),
+                match_type: AmsatMatchType::ExactApiName,
+                score: 0.99,
+            });
+        }
+    }
+
+    None
+}
+
+/// Check base name match
+fn base_name_match(entry: &AmsatEntry, query_normalized: &str) -> Option<AmsatSearchResult> {
+    let base_normalized = normalize_for_search(&entry.satellite_base_name);
+
+    if base_normalized == query_normalized {
+        return Some(AmsatSearchResult {
+            entry: (*entry).clone(),
+            match_type: AmsatMatchType::BaseName,
+            score: 0.95,
+        });
+    }
+
+    None
+}
+
+/// Check contains match
+fn contains_match(entry: &AmsatEntry, query_normalized: &str) -> Option<AmsatSearchResult> {
+    let api_normalized = normalize_for_search(&entry.api_name);
+
+    if api_normalized.contains(query_normalized) || query_normalized.contains(&api_normalized) {
+        let score = query_normalized.len() as f64 / api_normalized.len().max(1) as f64;
+        return Some(AmsatSearchResult {
+            entry: (*entry).clone(),
+            match_type: AmsatMatchType::Contains,
+            score: score.min(0.90),
+        });
+    }
+
+    // Check aliases
+    for alias in &entry.aliases {
+        let alias_normalized = normalize_for_search(alias);
+        if alias_normalized.contains(query_normalized) || query_normalized.contains(&alias_normalized)
+        {
+            let score = query_normalized.len() as f64 / alias_normalized.len().max(1) as f64;
+            return Some(AmsatSearchResult {
+                entry: (*entry).clone(),
+                match_type: AmsatMatchType::Contains,
+                score: score.min(0.89),
+            });
+        }
+    }
+
+    None
+}
+
+/// Fuzzy match using Jaro-Winkler similarity
+fn fuzzy_match_amsat(
+    entry: &AmsatEntry,
+    query_normalized: &str,
+    threshold: f64,
+) -> Option<AmsatSearchResult> {
+    let api_normalized = normalize_for_search(&entry.api_name);
+    let score = jaro_winkler(&api_normalized, query_normalized);
+
+    if score >= threshold {
+        return Some(AmsatSearchResult {
+            entry: (*entry).clone(),
+            match_type: AmsatMatchType::Fuzzy,
+            score,
+        });
+    }
+
+    // Check aliases
+    for alias in &entry.aliases {
+        let alias_normalized = normalize_for_search(alias);
+        let alias_score = jaro_winkler(&alias_normalized, query_normalized);
+        if alias_score >= threshold {
+            return Some(AmsatSearchResult {
+                entry: (*entry).clone(),
+                match_type: AmsatMatchType::Fuzzy,
+                score: alias_score,
+            });
+        }
+    }
+
+    // Check base name
+    let base_normalized = normalize_for_search(&entry.satellite_base_name);
+    let base_score = jaro_winkler(&base_normalized, query_normalized);
+    if base_score >= threshold {
+        return Some(AmsatSearchResult {
+            entry: (*entry).clone(),
+            match_type: AmsatMatchType::Fuzzy,
+            score: base_score,
+        });
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_entries() -> Vec<AmsatEntry> {
+        vec![
+            AmsatEntry::from_api_name("ISS-FM"),
+            AmsatEntry::from_api_name("ISS-SSTV"),
+            AmsatEntry::from_api_name("ISS-DATA"),
+            AmsatEntry::from_api_name("ISS-DATV"),
+            AmsatEntry::from_api_name("AO-91"),
+            AmsatEntry::from_api_name("AO-92"),
+            AmsatEntry::from_api_name("RS-44"),
+            AmsatEntry::from_api_name("FO-118[H/u]"),
+        ]
+    }
+
+    #[test]
+    fn test_search_exact_api_name() {
+        let entries = make_test_entries();
+        let refs: Vec<&AmsatEntry> = entries.iter().collect();
+
+        let results = search_amsat_entries("ISS-FM", &refs);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.api_name, "ISS-FM");
+        assert_eq!(results[0].match_type, AmsatMatchType::ExactApiName);
+    }
+
+    #[test]
+    fn test_search_exact_case_insensitive() {
+        let entries = make_test_entries();
+        let refs: Vec<&AmsatEntry> = entries.iter().collect();
+
+        let results = search_amsat_entries("iss-fm", &refs);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.api_name, "ISS-FM");
+    }
+
+    #[test]
+    fn test_search_exact_no_separator() {
+        let entries = make_test_entries();
+        let refs: Vec<&AmsatEntry> = entries.iter().collect();
+
+        // "issfm" should match "ISS-FM" via alias
+        let results = search_amsat_entries("issfm", &refs);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].entry.api_name, "ISS-FM");
+    }
+
+    #[test]
+    fn test_search_base_name_returns_all() {
+        let entries = make_test_entries();
+        let refs: Vec<&AmsatEntry> = entries.iter().collect();
+
+        // "iss" should match all ISS-* entries
+        let results = search_amsat_entries("iss", &refs);
+        assert_eq!(results.len(), 4);
+        let names: Vec<&str> = results.iter().map(|r| r.entry.api_name.as_str()).collect();
+        assert!(names.contains(&"ISS-FM"));
+        assert!(names.contains(&"ISS-SSTV"));
+        assert!(names.contains(&"ISS-DATA"));
+        assert!(names.contains(&"ISS-DATV"));
+    }
+
+    #[test]
+    fn test_search_ao91() {
+        let entries = make_test_entries();
+        let refs: Vec<&AmsatEntry> = entries.iter().collect();
+
+        let results = search_amsat_entries("ao91", &refs);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].entry.api_name, "AO-91");
+    }
+
+    #[test]
+    fn test_search_no_match() {
+        let entries = make_test_entries();
+        let refs: Vec<&AmsatEntry> = entries.iter().collect();
+
+        let results = search_amsat_entries("ZZZZZ", &refs);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_bracket_name() {
+        let entries = make_test_entries();
+        let refs: Vec<&AmsatEntry> = entries.iter().collect();
+
+        let results = search_amsat_entries("FO-118", &refs);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].entry.api_name, "FO-118[H/u]");
+    }
+
+    #[test]
+    fn test_search_empty_query() {
+        let entries = make_test_entries();
+        let refs: Vec<&AmsatEntry> = entries.iter().collect();
+
+        let results = search_amsat_entries("", &refs);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_update_report_default() {
+        let report = UpdateReport::default();
+        assert_eq!(report.total_entries, 0);
+        assert_eq!(report.new_entries.len(), 0);
     }
 }

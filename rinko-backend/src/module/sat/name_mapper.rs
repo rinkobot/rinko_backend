@@ -1,3 +1,5 @@
+use crate::module::sat::search::DEFAULT_THRESHOLD;
+
 ///! Name mapper - Maps CSV satellite names to AMSAT API names
 ///!
 ///! Handles the mapping between:
@@ -29,14 +31,14 @@ pub struct NameMappingConfig {
 }
 
 fn default_threshold() -> f64 {
-    0.85
+    DEFAULT_THRESHOLD
 }
 
 impl Default for NameMappingConfig {
     fn default() -> Self {
         Self {
             manual_mappings: Self::default_manual_mappings(),
-            fuzzy_threshold: 0.85,
+            fuzzy_threshold: DEFAULT_THRESHOLD,
             norad_to_amsat_names: HashMap::new(),
         }
     }

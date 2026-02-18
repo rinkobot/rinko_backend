@@ -1,22 +1,26 @@
 ///! Satellite status management module
-///! 
+///!
 ///! This module provides comprehensive satellite status tracking from AMSAT API.
-///! 
-///! ## Features
-///! - Automatic satellite data updates
-///! - Satellite search and querying
-///! - File-based caching
-///! - Hot-reloadable configuration
-///! - SVG/PNG rendering
-///! 
+///!
+///! ## Architecture (Dual-Store)
+///! - Primary: AMSAT entries (keyed by API name, e.g. "ISS-FM", "AO-91")
+///! - Secondary: FrequencyDatabase (GitHub CSV metadata, read-only reference)
+///!
 ///! ## Main Components
-///! - `SatelliteManager`: Core manager for satellite data (V2 - NORAD ID based)
-///! - `SatelliteUpdater`: Scheduled update task runner
+///! - `SatelliteManager`: Core manager with dual-store architecture
 ///! - `SatelliteRenderer`: Image generation from satellite data
+///! - `AmsatEntry`: Primary data unit for user queries
 
-// ============ Core Data Structures (V2) ============
+// ============ Core Data Structures ============
 mod types;
 pub use types::*;
+
+// ============ AMSAT Entry Types ============
+mod amsat_types;
+pub use amsat_types::{
+    AmsatEntry, ParsedAmsatName, parse_amsat_name, normalize_for_search,
+    find_matching_transponder_index,
+};
 
 // ============ Data Source Management ============
 mod frequency_db;
@@ -27,9 +31,12 @@ pub use name_mapper::{NameMapper, NameMappingConfig, MappingReport, MappingStats
 
 // ============ Core Manager ============
 mod manager;
-pub use manager::{SatelliteManager, UpdateReport};
+pub use manager::{
+    SatelliteManager, UpdateReport,
+    AmsatSearchResult, AmsatMatchType, TransponderMetadata,
+};
 
-// ============ Search Engine ============
+// ============ Search Engine (legacy, kept for compatibility) ============
 mod search;
 pub use search::{
     search_transponders, search_with_keywords, search_multiple,
