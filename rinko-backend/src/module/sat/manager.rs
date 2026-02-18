@@ -1,3 +1,5 @@
+use crate::module::sat::search::DEFAULT_THRESHOLD;
+
 ///! Satellite Manager - Dual-store architecture
 ///!
 ///! Primary store: AMSAT entries (keyed by API name)
@@ -516,7 +518,7 @@ fn search_amsat_entries(query: &str, entries: &[&AmsatEntry]) -> Vec<AmsatSearch
     }
 
     // Phase 4: Fuzzy match (Jaro-Winkler)
-    let fuzzy_threshold = 0.80;
+    let fuzzy_threshold = DEFAULT_THRESHOLD;
     for entry in entries {
         if let Some(result) = fuzzy_match_amsat(entry, &query_normalized, fuzzy_threshold) {
             results.push(result);
@@ -575,6 +577,7 @@ fn contains_match(entry: &AmsatEntry, query_normalized: &str) -> Option<AmsatSea
 
     if api_normalized.contains(query_normalized) || query_normalized.contains(&api_normalized) {
         let score = query_normalized.len() as f64 / api_normalized.len().max(1) as f64;
+        // TODO: give fm higher score
         return Some(AmsatSearchResult {
             entry: (*entry).clone(),
             match_type: AmsatMatchType::Contains,
