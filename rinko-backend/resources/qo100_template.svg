@@ -1,0 +1,55 @@
+<svg width="920" height="{{SVG_HEIGHT}}" xmlns="http://www.w3.org/2000/svg">
+<rect width="100%" height="100%" fill="#ffffff" />
+<style>
+  .header-text {
+    font-family: 'Roboto', sans-serif;
+    font-weight: 700;
+    fill: #666;
+    font-size: 14px;
+  }
+  .cell-text {
+    font-family: 'JetBrains Mono NL', 'Consolas', monospace;
+    fill: #333;
+    font-size: 12px;
+  }
+  .dx-text {
+    font-family: 'JetBrains Mono NL', 'Consolas', monospace;
+    fill: #0056b3;
+    font-size: 13px;
+    font-weight: bold;
+  }
+  .time-text {
+    font-family: 'Consolas', monospace;
+    fill: #0056b3;
+    font-size: 12px;
+  }
+  .footer-text {
+    font-family: "Consolas", Helvetica, sans-serif;
+    font-size: 11px;
+    fill: #ced4da;
+    dominant-baseline: middle;
+  }
+</style>
+
+<!-- ── Header bar ── -->
+<rect width="920" height="50" fill="#f1f3f5" />
+<text x="20" y="32" font-family="Noto Serif CJK JP" font-size="20" font-weight="bold" fill="#212529">QO-100 DX Cluster</text>
+<text x="900" y="32" font-family="Noto Serif CJK JP" font-size="12" font-weight="normal" fill="#6c757d" text-anchor="end">Powered by Rinko. Generated: {{GENERATED_AT}}</text>
+
+<!-- ── Column header row ── -->
+<rect x="0" y="50" width="920" height="36" fill="#e9ecef"/>
+<text x="20"  y="70" class="header-text">Date/Time</text>
+<text x="180" y="70" class="header-text">DX</text>
+<text x="340" y="70" class="header-text">Freq.</text>
+<text x="420" y="70" class="header-text">Comments</text>
+<text x="700" y="70" class="header-text">Spotter</text>
+<text x="840" y="70" class="header-text">Source</text>
+
+<!-- ── Data rows ── -->
+{{ROWS}}
+
+<!-- ── Footer ── -->
+<rect x="0" y="{{FOOTER_Y}}" width="920" height="30" fill="#343a40"/>
+<text x="460" y="{{FOOTER_TEXT_Y}}" class="footer-text" text-anchor="middle">Data source: QO-100 DX Club</text>
+
+</svg>

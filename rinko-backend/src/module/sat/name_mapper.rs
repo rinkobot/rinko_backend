@@ -47,30 +47,8 @@ impl Default for NameMappingConfig {
 impl NameMappingConfig {
     /// Default manual mappings for known problematic cases
     fn default_manual_mappings() -> HashMap<String, Vec<String>> {
-        let mut mappings = HashMap::new();
-        
-        // ISS has multiple transponders in AMSAT API
-        mappings.insert(
-            "ISS".to_string(),
-            vec![
-                "ISS FM".to_string(),
-                "ISS SSTV".to_string(),
-                "ISS DATA".to_string(),
-                "ISS DATV".to_string(),
-            ],
-        );
-        
-        // Add more known cases here
-        mappings.insert(
-            "AO-7".to_string(),
-            vec!["AO-7".to_string()],
-        );
-        
-        mappings.insert(
-            "AO-91".to_string(),
-            vec!["AO-91".to_string(), "Fox-1B".to_string()],
-        );
-        
+        let mappings = HashMap::new();
+        // TODO: Load default mappings from file
         mappings
     }
     

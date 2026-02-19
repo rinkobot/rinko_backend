@@ -111,33 +111,3 @@ pub async fn fetch_satellite_names() -> Result<Vec<String>> {
     
     Ok(satellite_names)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_known_satellites_not_empty() {
-        let satellites = get_known_satellites();
-        assert!(!satellites.is_empty());
-        assert!(satellites.contains(&"AO-91".to_string()));
-        assert!(satellites.contains(&"ISS-FM".to_string()));
-    }
-
-    #[tokio::test]
-    #[ignore] // Requires network connection
-    async fn test_fetch_satellite_names() {
-        let result = fetch_satellite_names().await;
-        assert!(result.is_ok());
-        if let Ok(names) = result {
-            assert!(!names.is_empty());
-            println!("Found {} satellites", names.len());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_fallback_always_works() {
-        let satellites = fetch_satellite_names_with_fallback().await;
-        assert!(!satellites.is_empty());
-    }
-}

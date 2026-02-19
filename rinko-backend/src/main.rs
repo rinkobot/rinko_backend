@@ -39,6 +39,8 @@ async fn main() -> Result<()> {
     // Configure and start scheduled tasks
     let task_config = ScheduledTaskConfig {
         satellite_update_interval_minutes: update_interval_minutes,
+        lotw_update_interval_minutes: 60, // Update LoTW status every hour
+        qo100_update_interval_minutes: 10, // Update QO-100 cluster every 10 minutes
         image_cleanup_interval_hours: 24, // Clean images daily
         image_retention_days: 1, // Keep images for 1 day
         cache_dir: cache_dir.to_string(),
@@ -49,8 +51,10 @@ async fn main() -> Result<()> {
     task_manager.start_all().await?;
     tracing::info!("All scheduled tasks started successfully");
 
-    // Create gRPC service with satellite manager
-    let bot_service = BotBackendService::new(satellite_manager);
+    // Create gRPC service with satellite manager and LoTW updater
+    let lotw_updater = task_manager.lotw_updater();
+    let qo100_updater = task_manager.qo100_updater();
+    let bot_service = BotBackendService::new(satellite_manager, lotw_updater, qo100_updater);
     let server_addr = config.server_address().parse()?;
 
     tracing::info!("gRPC server starting on {}", server_addr);

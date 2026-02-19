@@ -11,6 +11,9 @@ pub struct BackendConfig {
     
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    #[serde(default = "default_media_server_url")]
+    pub media_server_url: Option<String>,
 }
 
 fn default_host() -> String {
@@ -19,6 +22,10 @@ fn default_host() -> String {
 
 fn default_port() -> u16 {
     50051
+}
+
+fn default_media_server_url() -> Option<String> {
+    None
 }
 
 fn default_log_level() -> String {
@@ -31,6 +38,7 @@ impl Default for BackendConfig {
             host: default_host(),
             port: default_port(),
             log_level: default_log_level(),
+            media_server_url: default_media_server_url(),
         }
     }
 }

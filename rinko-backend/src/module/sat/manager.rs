@@ -577,7 +577,13 @@ fn contains_match(entry: &AmsatEntry, query_normalized: &str) -> Option<AmsatSea
 
     if api_normalized.contains(query_normalized) || query_normalized.contains(&api_normalized) {
         let score = query_normalized.len() as f64 / api_normalized.len().max(1) as f64;
-        // TODO: give fm higher score
+        if api_normalized.contains("fm") && query_normalized.contains("fm") {
+            return Some(AmsatSearchResult {
+                entry: (*entry).clone(),
+                match_type: AmsatMatchType::Contains,
+                score: 0.98,
+            });
+        }
         return Some(AmsatSearchResult {
             entry: (*entry).clone(),
             match_type: AmsatMatchType::Contains,

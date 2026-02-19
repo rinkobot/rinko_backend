@@ -231,7 +231,7 @@ pub fn check_special_keywords(query: &str, satellites: &[Satellite]) -> Option<V
                 }
             }
         }
-        "image" => {
+        "image" | "img" => {
             let mut results = Vec::new();
             for sat in satellites {
                 for trans in &sat.transponders {

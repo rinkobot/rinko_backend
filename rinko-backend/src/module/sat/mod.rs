@@ -12,11 +12,11 @@
 ///! - `AmsatEntry`: Primary data unit for user queries
 
 // ============ Core Data Structures ============
-mod types;
+pub mod types;
 pub use types::*;
 
 // ============ AMSAT Entry Types ============
-mod amsat_types;
+pub mod amsat_types;
 pub use amsat_types::{
     AmsatEntry, ParsedAmsatName, parse_amsat_name, normalize_for_search,
     find_matching_transponder_index,
@@ -30,7 +30,7 @@ mod name_mapper;
 pub use name_mapper::{NameMapper, NameMappingConfig, MappingReport, MappingStats};
 
 // ============ Core Manager ============
-mod manager;
+pub mod manager;
 pub use manager::{
     SatelliteManager, UpdateReport,
     AmsatSearchResult, AmsatMatchType, TransponderMetadata,
@@ -42,10 +42,6 @@ pub use search::{
     search_transponders, search_with_keywords, search_multiple,
     SearchResult, MatchType, filter_by_transponder, get_active_satellites,
 };
-
-// ============ Rendering System ============
-mod renderer;
-pub use renderer::SatelliteRenderer;
 
 // ============ API Client and Scraper ============
 mod api_client;

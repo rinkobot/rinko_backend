@@ -7,6 +7,8 @@
 
 use super::sat::{SatelliteManager, cleanup_old_images};
 use super::dx_world::dx_world::DxWorldScraper;
+use super::lotw::LotwUpdater;
+use super::qo100::Qo100Updater;
 use chrono::{DateTime, Timelike, Utc};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,6 +19,12 @@ use tokio::task::JoinHandle;
 pub struct ScheduledTaskConfig {
     /// Interval for satellite updates (in minutes)
     pub satellite_update_interval_minutes: u64,
+
+    /// Interval for LoTW status updates (in minutes)
+    pub lotw_update_interval_minutes: u64,
+
+    /// Interval for QO-100 DX Cluster updates (in minutes)
+    pub qo100_update_interval_minutes: u64,
     
     /// Interval for image cleanup (in hours)
     pub image_cleanup_interval_hours: u64,
@@ -34,9 +42,11 @@ pub struct ScheduledTaskConfig {
 impl Default for ScheduledTaskConfig {
     fn default() -> Self {
         Self {
-            satellite_update_interval_minutes: 10,
+            satellite_update_interval_minutes: 15,
+            lotw_update_interval_minutes: 60,
+            qo100_update_interval_minutes: 10,
             image_cleanup_interval_hours: 24,
-            image_retention_days: 7,
+            image_retention_days: 2,
             cache_dir: "data/satellite_cache".to_string(),
             perform_initial_update: true,
         }
@@ -47,6 +57,8 @@ impl Default for ScheduledTaskConfig {
 pub struct ScheduledTaskManager {
     config: ScheduledTaskConfig,
     satellite_manager: Arc<SatelliteManager>,
+    lotw_updater: Arc<LotwUpdater>,
+    qo100_updater: Arc<Qo100Updater>,
     task_handles: Vec<JoinHandle<()>>,
 }
 
@@ -56,8 +68,20 @@ impl ScheduledTaskManager {
         Self {
             config,
             satellite_manager,
+            lotw_updater: Arc::new(LotwUpdater::new(None)),
+            qo100_updater: Arc::new(Qo100Updater::new(None)),
             task_handles: Vec::new(),
         }
+    }
+
+    /// Expose the LoTW updater for use by message handlers
+    pub fn lotw_updater(&self) -> Arc<LotwUpdater> {
+        self.lotw_updater.clone()
+    }
+
+    /// Expose the QO-100 updater for use by message handlers
+    pub fn qo100_updater(&self) -> Arc<Qo100Updater> {
+        self.qo100_updater.clone()
     }
 
     /// Start all scheduled tasks
@@ -75,11 +99,21 @@ impl ScheduledTaskManager {
         // Start DX World scraper task
         let dx_world_handle = self.start_dx_world_scraper_loop().await?;
         self.task_handles.push(dx_world_handle);
+
+        // Start LoTW update task
+        let lotw_handle = self.start_lotw_update_loop().await?;
+        self.task_handles.push(lotw_handle);
+
+        // Start QO-100 DX Cluster update task
+        let qo100_handle = self.start_qo100_update_loop().await?;
+        self.task_handles.push(qo100_handle);
         
         tracing::info!(
-            "Started {} scheduled tasks (satellite updates every {} min, image cleanup every {} hours)",
+            "Started {} scheduled tasks (satellite every {} min, LoTW every {} min, QO-100 every {} min, cleanup every {} hours)",
             self.task_handles.len(),
             self.config.satellite_update_interval_minutes,
+            self.config.lotw_update_interval_minutes,
+            self.config.qo100_update_interval_minutes,
             self.config.image_cleanup_interval_hours
         );
         
@@ -99,6 +133,56 @@ impl ScheduledTaskManager {
                 tokio::time::sleep(Duration::from_secs(6 * 3600)).await; // Sleep for 6 hours
             }
         });
+        Ok(handle)
+    }
+
+    // LOTW update loop (fetch every N minutes)
+    pub async fn start_lotw_update_loop(&self) -> anyhow::Result<JoinHandle<()>> {
+        let lotw = self.lotw_updater.clone();
+        let interval_minutes = self.config.lotw_update_interval_minutes;
+        tracing::info!("Starting LoTW update loop (every {} minutes)...", interval_minutes);
+
+        let handle = tokio::spawn(async move {
+            // Initial update immediately
+            match lotw.update().await {
+                Ok(path) => tracing::info!("Initial LoTW update OK → {:?}", path),
+                Err(e)   => tracing::error!("Initial LoTW update failed: {}", e),
+            }
+
+            loop {
+                tokio::time::sleep(Duration::from_secs(interval_minutes * 60)).await;
+                match lotw.update().await {
+                    Ok(path) => tracing::info!("LoTW update OK → {:?}", path),
+                    Err(e)   => tracing::error!("LoTW update failed: {}", e),
+                }
+            }
+        });
+
+        Ok(handle)
+    }
+
+    // QO-100 DX Cluster update loop (fetch every N minutes)
+    pub async fn start_qo100_update_loop(&self) -> anyhow::Result<JoinHandle<()>> {
+        let qo100 = self.qo100_updater.clone();
+        let interval_minutes = self.config.qo100_update_interval_minutes;
+        tracing::info!("Starting QO-100 update loop (every {} minutes)...", interval_minutes);
+
+        let handle = tokio::spawn(async move {
+            // Initial update immediately
+            match qo100.update().await {
+                Ok(path) => tracing::info!("Initial QO-100 update OK → {:?}", path),
+                Err(e)   => tracing::error!("Initial QO-100 update failed: {}", e),
+            }
+
+            loop {
+                tokio::time::sleep(Duration::from_secs(interval_minutes * 60)).await;
+                match qo100.update().await {
+                    Ok(path) => tracing::info!("QO-100 update OK → {:?}", path),
+                    Err(e)   => tracing::error!("QO-100 update failed: {}", e),
+                }
+            }
+        });
+
         Ok(handle)
     }
 
@@ -254,6 +338,36 @@ impl ScheduledTaskManager {
     /// Image cleanup loop
     async fn image_cleanup_loop(cache_dir: String, interval_hours: u64, retention_days: i64) {
         loop {
+            // Execute cleanup once started
+            match Self::run_image_cleanup(&cache_dir, retention_days).await {
+                Ok(deleted_count) => {
+                    if deleted_count > 0 {
+                        tracing::info!("Initial image cleanup completed: deleted {} old images", deleted_count);
+                    } else {
+                        tracing::debug!("Initial image cleanup completed: no old images to delete");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Initial image cleanup failed: {}", e);
+                }
+            }
+
+            match super::dx_world::dx_world::cleanup_old_dx_world_files(
+                &std::path::PathBuf::from("data/dx_world"),
+                retention_days
+            ).await {
+                Ok(deleted_count) => {
+                    if deleted_count > 0 {
+                        tracing::info!("Initial DX World file cleanup completed: deleted {} old files", deleted_count);
+                    } else {
+                        tracing::debug!("Initial DX World file cleanup completed: no old files to delete");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Initial DX World file cleanup failed: {}", e);
+                }
+            }
+
             let now = Utc::now();
             let next_trigger = Self::calculate_next_cleanup_time(now, interval_hours);
             let sleep_duration = (next_trigger - now)

@@ -4,17 +4,23 @@ use regex::Regex;
 use anyhow::Result;
 use std::sync::Arc;
 
-use super::sat::{SatelliteManager, SatelliteRenderer};
+use crate::config::CONFIG;
+use super::sat::SatelliteManager;
+use super::lotw::LotwUpdater;
+use super::qo100::Qo100Updater;
+use super::renderer::SatelliteRenderer;
 
 /// Message handler with satellite manager
 pub struct MessageHandler {
     satellite_manager: Arc<SatelliteManager>,
+    lotw_updater: Arc<LotwUpdater>,
+    qo100_updater: Arc<Qo100Updater>,
 }
 
 impl MessageHandler {
     /// Create a new message handler
-    pub fn new(satellite_manager: Arc<SatelliteManager>) -> Self {
-        Self { satellite_manager }
+    pub fn new(satellite_manager: Arc<SatelliteManager>, lotw_updater: Arc<LotwUpdater>, qo100_updater: Arc<Qo100Updater>) -> Self {
+        Self { satellite_manager, lotw_updater, qo100_updater }
     }
     
     /// Handle incoming message
@@ -62,13 +68,25 @@ impl MessageHandler {
         match command {
             "q" | "query" => self.amsat_query(args).await,
             "dxw" => {
-                Ok(MessageResponse {
-                    success: true,
-                    message: "data/image_cache/dxw_latest.png".to_string(),
-                    message_id: uuid::Uuid::now_v7().to_string(),
-                    content_type: rinko_common::proto::ContentType::Image as i32,
-                })
+                let pic_path = "data/image_cache/dxw_latest.png";
+                if std::path::Path::new(pic_path).exists() && is_media_server_running().await {
+                    Ok(MessageResponse {
+                        success: true,
+                        message: format!("file:///{}", pic_path.replace("\\", "/")),
+                        message_id: uuid::Uuid::now_v7().to_string(),
+                        content_type: rinko_common::proto::ContentType::Image as i32,
+                    })
+                } else {
+                    Ok(MessageResponse {
+                        success: false,
+                        message: "DXW image not found or media server down.".to_string(),
+                        message_id: uuid::Uuid::now_v7().to_string(),
+                        content_type: rinko_common::proto::ContentType::Text as i32,
+                    })
+                }
             }
+            "lotw" => self.lotw_query().await,
+            "qo100" | "qo-100" => self.qo100_query().await,
             _ => {
                 Ok(MessageResponse {
                     success: false,
@@ -82,6 +100,15 @@ impl MessageHandler {
     
     /// Query satellite information
     async fn amsat_query(&self, query: &str) -> Result<MessageResponse> {
+        if !is_media_server_running().await {
+            return Ok(MessageResponse {
+                success: false,
+                message: "Media server down, please contact rinko@rinkosoft.me".to_string(),
+                message_id: uuid::Uuid::now_v7().to_string(),
+                content_type: ContentType::Text as i32,
+            });
+        }
+
         let query = query.trim();
         
         if query.is_empty() {
@@ -139,6 +166,45 @@ impl MessageHandler {
             }
         }
     }
+    /// Query LoTW queue status image
+    async fn lotw_query(&self) -> Result<MessageResponse> {
+        let lotw_img_path = "data/image_cache/lotw_latest.png";
+        if std::path::Path::new(lotw_img_path).exists() && is_media_server_running().await {
+            Ok(MessageResponse {
+                success: true,
+                message: format!("file:///{}", lotw_img_path.replace("\\", "/")),
+                message_id: uuid::Uuid::now_v7().to_string(),
+                content_type: ContentType::Image as i32,
+            })
+        } else {
+            Ok(MessageResponse {
+                success: false,
+                message: "LoTW image not found or media server down.".to_string(),
+                message_id: uuid::Uuid::now_v7().to_string(),
+                content_type: ContentType::Text as i32,
+            })
+        }
+    }
+
+    /// Query QO-100 DX Cluster image
+    async fn qo100_query(&self) -> Result<MessageResponse> {
+        let qo100_img_path = "data/image_cache/qo100_latest.png";
+        if std::path::Path::new(qo100_img_path).exists() && is_media_server_running().await {
+            Ok(MessageResponse {
+                success: true,
+                message: format!("file:///{}", qo100_img_path.replace("\\", "/")),
+                message_id: uuid::Uuid::now_v7().to_string(),
+                content_type: ContentType::Image as i32,
+            })
+        } else {
+            Ok(MessageResponse {
+                success: false,
+                message: "QO-100 image not found or media server down.".to_string(),
+                message_id: uuid::Uuid::now_v7().to_string(),
+                content_type: ContentType::Text as i32,
+            })
+        }
+    }
 }
 
 /// Parse command from message content
@@ -150,6 +216,29 @@ fn parse_command(content: &str) -> Option<(String, String)> {
         Some((command, args))
     } else {
         None
+    }
+}
+
+/// Check if the media server is running
+/// by accessing config.
+async fn is_media_server_running() -> bool {
+    let config = CONFIG.get();
+    if let Some(cfg) = config {
+        if let Some(media_server_url) = &cfg.media_server_url {
+            let url = format!("https://{}/health", media_server_url);
+            tracing::info!("Checking media server health at {}", url);
+            // Try to send a request to the media server's health endpoint
+            match reqwest::get(&url).await {
+                Ok(resp) => resp.status().is_success(),
+                Err(_) => false,
+            }
+        }
+        else {
+            // assume media server is not running
+            false
+        }
+    } else {
+        false
     }
 }
 

@@ -109,7 +109,7 @@ impl AmsatEntry {
 const MODE_KEYWORDS: &[&str] = &[
     "FM", "SSTV", "DATA", "DATV", "LINEAR", "LIN", "IMAGE", "IMG",
     "CW", "SSB", "DIGI", "APRS", "PACKET", "V/U", "U/V", "H/U", "V/U FM",
-    "L", "S", "X",
+    "L", "S", "X", "A", "B"
 ];
 
 /// Result of parsing an AMSAT API name
