@@ -56,17 +56,24 @@ pub struct BotConfigs {
 pub static CONFIG: OnceLock<BotConfigs> = OnceLock::new();
     
 pub fn read_config() -> anyhow::Result<()> {
-    let path = "../config.toml";
-    let config_str = std::fs::read_to_string(path)?;
-    let config: BotConfigs = match toml::from_str(&config_str) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            eprintln!("Failed to parse config file {}: {}", path, e);
-            panic!()
-        }
-    };
+    // E-3: path is resolved from $RINKO_CONFIG env var, falling back to "../config.toml".
+    // The fallback is relative to the current working directory, so prefer setting
+    // RINKO_CONFIG to an absolute path in production deployments.
+    let path = std::env::var("RINKO_CONFIG")
+        .unwrap_or_else(|_| "../config.toml".to_string());
 
-    CONFIG.set(config.clone()).unwrap();
+    // E-1: propagate I/O errors instead of panicking so callers can handle them.
+    let config_str = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("Failed to read config file '{}': {}", path, e))?;
+
+    // E-1: propagate parse errors via '?' instead of panicking.
+    let config: BotConfigs = toml::from_str(&config_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse config file '{}': {}", path, e))?;
+
+    // E-2: no unnecessary clone; map the OnceLock error to a proper anyhow error.
+    CONFIG
+        .set(config)
+        .map_err(|_| anyhow::anyhow!("Config is already initialized (read_config called twice)"))?;
 
     Ok(())
 }

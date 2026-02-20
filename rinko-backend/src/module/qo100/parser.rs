@@ -51,6 +51,7 @@ pub fn parse_qo100_json(json: &str) -> Result<Qo100Snapshot> {
     let resp: ClusterResponse =
         serde_json::from_str(json).context("Failed to deserialize QO-100 cluster JSON")?;
 
+    // Get 10 latest spots, convert to Qo100Spot, and reverse to newest-first order
     let mut spots: Vec<Qo100Spot> = resp
         .spots
         .into_iter()
@@ -66,6 +67,7 @@ pub fn parse_qo100_json(json: &str) -> Result<Qo100Snapshot> {
 
     // API returns oldest-first; reverse so newest is first (like the web page)
     spots.reverse();
+    spots.truncate(10);
 
     Ok(Qo100Snapshot {
         fetched_at: Utc::now(),

@@ -99,3 +99,32 @@ impl ContentType {
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum CommandType {
+    #[default]
+    Unspecified,
+    SendMessage,
+    Shutdown,
+    GetStatus,
+}
+
+impl CommandType {
+    pub fn to_proto(&self) -> crate::proto::CommandType {
+        match self {
+            CommandType::Unspecified => crate::proto::CommandType::Unspecified,
+            CommandType::SendMessage => crate::proto::CommandType::SendMessage,
+            CommandType::Shutdown => crate::proto::CommandType::Shutdown,
+            CommandType::GetStatus => crate::proto::CommandType::GetStatus,
+        }
+    }
+
+    pub fn from_proto(proto: crate::proto::CommandType) -> Self {
+        match proto {
+            crate::proto::CommandType::Unspecified => CommandType::Unspecified,
+            crate::proto::CommandType::SendMessage => CommandType::SendMessage,
+            crate::proto::CommandType::Shutdown => CommandType::Shutdown,
+            crate::proto::CommandType::GetStatus => CommandType::GetStatus,
+        }
+    }
+}

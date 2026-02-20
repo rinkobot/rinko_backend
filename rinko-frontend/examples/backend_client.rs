@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use anyhow::Result;
 use chrono::Utc;
 use tokio::sync::mpsc;
@@ -9,10 +7,11 @@ use tonic::{Request, Response, Status};
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
-use rinko_frontend::backend::proto::{
+// The proto types live in rinko-common, not rinko-frontend.
+use rinko_common::proto::{
     bot_backend_server::{BotBackend, BotBackendServer},
-    BotCommand, HeartbeatRequest, HeartbeatResponse, MessageResponse, Platform, SubscribeRequest,
-    UnifiedMessage,
+    BotCommand, CommandType, ContentType, HeartbeatRequest, HeartbeatResponse, MessageResponse,
+    Platform, SubscribeRequest, UnifiedMessage,
 };
 
 #[derive(Default)]
@@ -43,6 +42,7 @@ impl BotBackend for MockBackend {
             success: true,
             message: reply,
             message_id: Uuid::now_v7().to_string(),
+            content_type: ContentType::Text as i32,
         };
 
         Ok(Response::new(response))
@@ -63,15 +63,12 @@ impl BotBackend for MockBackend {
 
         let (tx, rx) = mpsc::channel(4);
 
-        let mut parameters = HashMap::new();
-        parameters.insert("note".to_string(), "example command".to_string());
-
         let _ = tx
             .send(Ok(BotCommand {
                 command_id: Uuid::now_v7().to_string(),
-                command_type: "get_status".to_string(),
-                parameters,
+                command_type: CommandType::GetStatus as i32,
                 timestamp: Utc::now().timestamp(),
+                payload: None,
             }))
             .await;
 

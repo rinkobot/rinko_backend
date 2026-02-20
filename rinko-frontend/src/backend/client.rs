@@ -18,6 +18,11 @@ use rinko_common::Platform;
 use crate::utils::UnifiedMessage;
 
 /// gRPC client wrapper for communicating with the backend
+///
+/// `BotBackendClient<Channel>` uses tonic's `Channel` which is backed by an H2 multiplexed
+/// connection. Cloning produces a new handle to the same underlying TCP connection, so
+/// subscription and request-response calls can share one physical connection.
+#[derive(Clone)]
 pub struct BackendClient {
     client: BotBackendClient<Channel>,
     frontend_id: String,

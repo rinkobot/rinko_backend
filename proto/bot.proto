@@ -20,6 +20,16 @@ enum ContentType {
   FILE = 4;
 }
 
+// P-3: Typed enum replacing the previous free-form command_type string.
+// Adding a new variant requires updating both sides, making
+// exhaustiveness failures visible at compile time.
+enum CommandType {
+  COMMAND_TYPE_UNSPECIFIED = 0;
+  SEND_MESSAGE = 1; // Backend instructs frontend to push a message
+  SHUTDOWN = 2; // Graceful shutdown request
+  GET_STATUS = 3; // Request frontend to report current status
+}
+
 // Unified message structure for cross-platform communication
 message UnifiedMessage {
   string event_id = 1; // UUID as string
@@ -37,12 +47,27 @@ message MessageResponse {
   ContentType content_type = 4; // Type of the content
 }
 
+// P-4: Structured payload for SEND_MESSAGE commands.
+// Replaces the previous untyped map<string, string> parameters field.
+message SendMessagePayload {
+  string target_openid = 1; // Target group / user openid
+  string content = 2; // Message body text, or file:///path for images
+  ContentType content_type = 3;
+}
+
 // Command from backend to frontend
 message BotCommand {
   string command_id = 1;
-  string command_type = 2; // e.g., "send_message", "get_status", "shutdown"
-  map<string, string> parameters = 3;
+  CommandType command_type = 2; // P-3: was string, now typed enum
+  reserved 3;                     // P-4: previously map<string, string> parameters
+  reserved "parameters";
   int64 timestamp = 4;
+
+  // P-4: Structured per-command payload. Only the variant that matches
+  // command_type should be populated; other fields are ignored by receivers.
+  oneof payload {
+    SendMessagePayload send_message = 10;
+  }
 }
 
 // Task subscription request
