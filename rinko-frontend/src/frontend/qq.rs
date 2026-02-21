@@ -5,11 +5,12 @@ use rinko_common::proto::MessageResponse;
 use rinko_common::proto::ContentType;
 use uuid::Uuid;
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use axum::{
     extract::State,
@@ -22,6 +23,23 @@ use axum::{
 
 const QQ_ACCESS_TOKEN_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 const QQ_AUTHORIZE_URL: &str = "https://api.sgroup.qq.com";
+
+/// Accept QQ's `timestamp` field whether it's an integer epoch or an RFC-3339
+/// string (the API is inconsistent across message types).
+fn deserialize_timestamp<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(deserializer)?;
+    match v {
+        serde_json::Value::String(s) => Ok(s),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        other => Err(serde::de::Error::custom(format!(
+            "expected string or number for timestamp, got: {}",
+            other
+        ))),
+    }
+}
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -96,7 +114,11 @@ struct UploadMediaResponse {
 #[derive(Deserialize, Debug)]
 pub struct SendMessageResponse {
     pub id: String,
-    pub timestamp: i64,
+    /// QQ may return either an integer epoch or an RFC-3339 string depending
+    /// on the API version / message type, so we accept both by treating it as
+    /// a raw JSON value and converting to string for display.
+    #[serde(deserialize_with = "deserialize_timestamp")]
+    pub timestamp: String,
 }
 
 #[derive(Clone)]
@@ -104,6 +126,11 @@ struct WebhookState {
     client_secret: String,  // used as bot_secret for signature verification
     qq_config: Arc<RwLock<QQConfig>>,
     backend_manager: Option<Arc<BackendConnectionManager>>,
+    /// Set of recently handled message IDs (message_id or event_id), used to
+    /// deduplicate repeated QQ webhook deliveries.  Entries older than 2 minutes
+    /// are purged on each insertion.  Protected by a std Mutex (never held
+    /// across an await point).
+    recent_event_ids: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 /// Webhook handler for QQ bot events
@@ -135,8 +162,8 @@ async fn handle_webhook(
         0 => {
             // op=0: Runtime event dispatch
             tracing::debug!("Handling runtime event (op=0)");
-            
-            // Verify signature for runtime events
+
+            // Verify signature before doing anything else
             let sig_header = headers.get("X-Signature-Ed25519")
                 .and_then(|v| v.to_str().ok());
             let timestamp_header = headers.get("X-Signature-Timestamp")
@@ -155,13 +182,52 @@ async fn handle_webhook(
                 return (StatusCode::UNAUTHORIZED, "Invalid signature").into_response();
             }
 
-            tracing::debug!("Signature verified successfully");
-            
-            // Handle the event
-            if let Some(event_type) = &payload.t {
-                tracing::info!("Event type: {}", event_type);
+            tracing::debug!("Signature verified");
+
+            if let Some(event_type) = payload.t.clone() {
                 let event_id = payload.d.get("id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                handle_event(&state.qq_config, &state.backend_manager, event_type, &payload.d, event_id).await;
+                let msg_id   = payload.d.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                // ----------------------------------------------------------
+                // Deduplication: QQ retries webhook delivery if it doesn't
+                // receive a timely response.  We track message IDs so that a
+                // second delivery of the same event is silently dropped.
+                // ----------------------------------------------------------
+                let dedup_key = format!("{}:{}", event_type, msg_id);
+                {
+                    let mut seen = state.recent_event_ids.lock().unwrap();
+                    // Purge entries older than 2 minutes
+                    let cutoff = Instant::now();
+                    seen.retain(|_, t| cutoff.duration_since(*t).as_secs() < 120);
+
+                    if seen.contains_key(&dedup_key) {
+                        tracing::warn!(
+                            "Duplicate webhook delivery for event '{}' id='{}', ignoring",
+                            event_type, msg_id
+                        );
+                        // Return 204 so QQ stops retrying this delivery
+                        return (StatusCode::NO_CONTENT, "").into_response();
+                    }
+                    seen.insert(dedup_key, Instant::now());
+                }
+
+                tracing::info!("Event type: {}", event_type);
+
+                // ----------------------------------------------------------
+                // Return 204 to QQ *immediately* so it stops retrying, then
+                // process the event in a background task.
+                // ----------------------------------------------------------
+                let state_bg = state.clone();
+                let data_bg  = payload.d.clone();
+                tokio::spawn(async move {
+                    handle_event(
+                        &state_bg.qq_config,
+                        &state_bg.backend_manager,
+                        &event_type,
+                        &data_bg,
+                        event_id,
+                    ).await;
+                });
             }
 
             (StatusCode::NO_CONTENT, "").into_response()
@@ -429,6 +495,7 @@ impl QQConfig {
             client_secret,
             qq_config: qq_config.clone(),
             backend_manager,
+            recent_event_ids: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let app = Router::new()
@@ -452,10 +519,24 @@ impl QQConfig {
                 "clientSecret": self.client_secret
             }))
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
 
-        let resp_json: serde_json::Value = resp.json().await?;
+        let status = resp.status();
+        let raw = resp.bytes().await?;
+        tracing::debug!(
+            "get_access_token response  status={} body={}",
+            status,
+            String::from_utf8_lossy(&raw)
+        );
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "get_access_token HTTP {}: {}",
+                status,
+                String::from_utf8_lossy(&raw)
+            ));
+        }
+
+        let resp_json: serde_json::Value = serde_json::from_slice(&raw)?;
         
         let token = resp_json
             .get("access_token")
@@ -467,7 +548,9 @@ impl QQConfig {
             .and_then(|s| s.parse::<u64>().ok());
 
         if let (Some(token), Some(expire)) = (token, expire) {
-            tracing::info!("Obtained QQ access token: {}, expires in: {}", token, expire);
+            // S-1 fix: log only prefix to avoid leaking the full credential
+            let masked = format!("{}…", &token[..token.len().min(8)]);
+            tracing::debug!("Obtained QQ access token prefix={} expires_in={}", masked, expire);
             self.access_token = token.to_string();
             self.token_expires_in = expire;
             self.token_fetched_at = Some(tokio::time::Instant::now());
@@ -514,8 +597,12 @@ impl QQConfig {
         });
     }
 
-    /// Upload media file and get file_info
-    /// 
+    /// Upload media file and get file_info, with automatic retry.
+    ///
+    /// QQ's media upload endpoint is occasionally flaky (transient 5xx or
+    /// empty/malformed responses). We retry up to 3 times with exponential
+    /// back-off (1 s, 2 s, 4 s) before giving up.
+    ///
     /// # Parameters
     /// - `group_openid`: The openid of the target group
     /// - `file_type`: 1=image, 2=video, 3=voice, 4=file
@@ -528,33 +615,104 @@ impl QQConfig {
         url: &str,
         srv_send_msg: bool,
     ) -> anyhow::Result<UploadMediaResponse> {
+        const MAX_ATTEMPTS: u32 = 3;
         let api_url = format!("{}/v2/groups/{}/files", QQ_AUTHORIZE_URL, group_openid);
-        
+
         let payload = UploadMediaRequest {
             file_type,
             url: url.to_string(),
             srv_send_msg,
         };
 
-        tracing::debug!("Uploading media to group {}: {:?}", group_openid, payload);
-
-        let resp = self.client
-            .post(&api_url)
-            .header("Authorization", format!("QQBot {}", self.access_token))
-            .json(&payload)
-            .timeout(std::time::Duration::from_secs(10))
-            .send()
-            .await?
-            .error_for_status()?;
-
-        let response: UploadMediaResponse = resp.json().await?;
         tracing::info!(
-            "Media uploaded - UUID: {}, TTL: {}s",
-            response.file_uuid,
-            response.ttl
+            "upload_group_media  group={} file_type={} url={}",
+            group_openid, file_type, url
         );
 
-        Ok(response)
+        let mut last_err = anyhow::anyhow!("upload_group_media: no attempts made");
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            if attempt > 1 {
+                let backoff = Duration::from_secs(1u64 << (attempt - 2)); // 1 s, 2 s
+                tracing::warn!(
+                    "upload_group_media attempt {}/{} after {:?} backoff (prev error: {})",
+                    attempt, MAX_ATTEMPTS, backoff, last_err
+                );
+                sleep(backoff).await;
+            }
+
+            let send_result = self.client
+                .post(&api_url)
+                .header("Authorization", format!("QQBot {}", self.access_token))
+                .json(&payload)
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .await;
+
+            let resp = match send_result {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("upload_group_media attempt {} network error: {}", attempt, e);
+                    last_err = e.into();
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            let raw = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("upload_group_media attempt {} body read error: {}", attempt, e);
+                    last_err = e.into();
+                    continue;
+                }
+            };
+
+            tracing::debug!(
+                "upload_group_media attempt {} response  status={} body={}",
+                attempt, status, String::from_utf8_lossy(&raw)
+            );
+
+            if status.is_server_error() {
+                // 5xx — transient, worth retrying
+                last_err = anyhow::anyhow!(
+                    "upload_group_media HTTP {} (attempt {}): {}",
+                    status, attempt, String::from_utf8_lossy(&raw)
+                );
+                continue;
+            }
+
+            if !status.is_success() {
+                // 4xx — permanent client error, no point retrying
+                return Err(anyhow::anyhow!(
+                    "upload_group_media HTTP {}: {}",
+                    status, String::from_utf8_lossy(&raw)
+                ));
+            }
+
+            match serde_json::from_slice::<UploadMediaResponse>(&raw) {
+                Ok(response) => {
+                    tracing::info!(
+                        "upload_group_media success (attempt {})  UUID={} TTL={}s",
+                        attempt, response.file_uuid, response.ttl
+                    );
+                    return Ok(response);
+                }
+                Err(e) => {
+                    // Parse failure on a 200 — log and retry; may be a partially
+                    // flushed response.
+                    last_err = anyhow::anyhow!(
+                        "upload_group_media parse error (attempt {}): {}  body={}",
+                        attempt, e, String::from_utf8_lossy(&raw)
+                    );
+                    tracing::warn!("{}", last_err);
+                    continue;
+                }
+            }
+        }
+
+        tracing::error!("upload_group_media failed after {} attempts: {}", MAX_ATTEMPTS, last_err);
+        Err(last_err)
     }
 
     /// Send rich media message to group
@@ -594,10 +752,29 @@ impl QQConfig {
             .json(&payload)
             .timeout(std::time::Duration::from_secs(5))
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
 
-        let response: SendMessageResponse = resp.json().await?;
+        let status = resp.status();
+        let raw = resp.bytes().await?;
+        tracing::debug!(
+            "send_group_media_message response  status={} body={}",
+            status,
+            String::from_utf8_lossy(&raw)
+        );
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "send_group_media_message HTTP {}: {}",
+                status,
+                String::from_utf8_lossy(&raw)
+            ));
+        }
+
+        let response: SendMessageResponse = serde_json::from_slice(&raw)
+            .map_err(|e| anyhow::anyhow!(
+                "send_group_media_message parse error: {}  body={}",
+                e,
+                String::from_utf8_lossy(&raw)
+            ))?;
         tracing::info!(
             "Media message sent successfully - ID: {}, Timestamp: {}",
             response.id,
@@ -704,14 +881,37 @@ impl QQConfig {
             .json(&payload)
             .timeout(std::time::Duration::from_secs(5))
             .send()
-            .await?
-            .error_for_status()?;
+            .await?;
 
-        let response: SendMessageResponse = match resp.json().await {
+        let status = resp.status();
+        let raw = resp.bytes().await
+            .map_err(|e| anyhow::anyhow!("Failed to read send_group_message response body: {}", e))?;
+        tracing::debug!(
+            "send_group_message response  status={} body={}",
+            status,
+            String::from_utf8_lossy(&raw)
+        );
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "send_group_message HTTP {}: {}",
+                status,
+                String::from_utf8_lossy(&raw)
+            ));
+        }
+
+        let response: SendMessageResponse = match serde_json::from_slice(&raw) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("Failed to parse send message response: {}", e);
-                return Err(anyhow::anyhow!("Failed to parse send message response: {}", e));
+                tracing::error!(
+                    "Failed to parse send_group_message response: {}  body={}",
+                    e,
+                    String::from_utf8_lossy(&raw)
+                );
+                return Err(anyhow::anyhow!(
+                    "Failed to parse send_group_message response: {}  body={}",
+                    e,
+                    String::from_utf8_lossy(&raw)
+                ));
             }
         };
         tracing::info!(
